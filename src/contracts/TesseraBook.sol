@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.24;
 
-// TODO: fee logic is mostly missing, cuz not super important (for now):
-//       - source-based fee increase (whitelisted, fingerprint-based)
-//       - priority-fee base fee increase
-//       - fee exemption for some addresses.
-
-import {IPoolManager} from '../interfaces/IPoolManager.sol';
+import {IBookManager} from '../interfaces/IBookManager.sol';
 import {ITesseraBook} from '../interfaces/ITesseraBook.sol';
+import {ITesseraEngine} from '../interfaces/ITesseraEngine.sol';
 
+// TODO: round UP where the original does (exact-out walk, fee gross-up); SafeERC20 in rescueTokens;
+//       OpenZeppelin ReentrancyGuard instead of the inline flag.
+
+/// @notice The book: one proxy per pair delegates here (see `TesseraBookProxy`). Prices trades, never moves tokens.
 contract TesseraBook is ITesseraBook {
   /*////////////////////////////////////////////////////////////
                             CONSTANTS
@@ -18,11 +18,11 @@ contract TesseraBook is ITesseraBook {
   uint256 internal constant PPM = 1e6;
   uint256 internal constant WAD = 1e18;
 
-  /// @dev Exact-out walks return this when the book cannot deliver the requested output
-  ///      (the original swap turns it into "T8: Insufficient Liquidity"). Exact-in returns 0 for the same case.
   /// @dev One slot per ladder is always reserved for the terminator.
   uint256 internal constant MAX_LEVELS_PER_UPDATE = MAX_BOOK_LEVELS - 1;
 
+  /// @dev Exact-out walks return this when the book cannot deliver the requested output
+  ///      (the original swap turns it into "T8: Insufficient Liquidity"). Exact-in returns 0 for the same case.
   uint256 internal constant NOT_FILLABLE = type(uint256).max;
 
   /// @dev What the age-fee calculation returns for "this quote is too old, do not fill" (original: uint32.max).
@@ -32,18 +32,19 @@ contract TesseraBook is ITesseraBook {
   uint96 internal constant DEFAULT_FEE_KEY = 0xdeadbeefdeadbeefdeadbeef;
 
   /*////////////////////////////////////////////////////////////
-                         STORAGE (only what the walks read)
+                             STORAGE
   ////////////////////////////////////////////////////////////*/
 
+  /// @dev Written by the PROXY (raw 32-byte word in slot 0), read here.
   Quote public quote;
   OrderBook internal clob;
 
-  /// @notice Total INPUT the pool received on the bid side (base units) since the last book update.
+  /// @notice Total INPUT the book received on the bid side (base units) since the last book update.
   uint256 public baseFlowAccumulator;
-  /// @notice Total INPUT the pool received on the ask side (quote units) since the last book update.
+  /// @notice Total INPUT the book received on the ask side (quote units) since the last book update.
   uint256 public quoteFlowAccumulator;
 
-  address public poolManager;
+  address public bookManager;
   bool public tradingEnabled;
   bool public nettingEnabled;
   uint8 public excludedBestLevels;
@@ -55,13 +56,13 @@ contract TesseraBook is ITesseraBook {
   address public quoteToken;
 
   /// @notice Share (ppm) of every trade's INPUT that is added to the flow accumulators: accumulator += input * factor / 1e6.
-  /// @dev Raw storage is a uint32, capped at 1e6 by the config setter.
+  /// @dev Raw storage is a uint32, capped at 1e6 by the config setters.
   uint24 public factor;
 
   address public multiSigOwner; // may only withdraw stray funds
   bool public isInitialized;
 
-  address public operator; // updates the book, the quote and the default fee; tunes the config
+  address public operator; // updates the book and the default fee; tunes the config (NOT the quote: see the proxy)
   uint32 public defaultFee; // ppm. Set by the operator, flipped within the block (see setDefaultFee).
 
   // ── fee parameters ──
@@ -74,14 +75,14 @@ contract TesseraBook is ITesseraBook {
   address public fingerprintHelper; // answers "does this (origin, sender) look like a known pattern?"
   address public modeFeeHelper; // maps the mode byte to a fee
 
-  /// @dev OZ-style reentrancy flag (1 = free, 2 = entered). TODO: swap for OpenZeppelin's ReentrancyGuard.
-  uint256 private _reentrancyStatus = 1;
+  /// @dev OZ-style reentrancy flag (1 = free, 2 = entered).
+  uint256 private reentrancyStatus = 1;
 
   modifier nonReentrant() {
-    require(_reentrancyStatus != 2, 'reentrancy');
-    _reentrancyStatus = 2;
+    require(reentrancyStatus != 2, 'reentrancy');
+    reentrancyStatus = 2;
     _;
-    _reentrancyStatus = 1;
+    reentrancyStatus = 1;
   }
 
   modifier onlyOperator() {
@@ -94,43 +95,17 @@ contract TesseraBook is ITesseraBook {
     _;
   }
 
-  /// @dev The operator OR the pool manager can pause and resume trading.
+  /// @dev The operator OR the book manager can pause and resume trading.
   modifier onlyTradingController() {
-    if (msg.sender != operator && msg.sender != poolManager) revert NotTradingController();
+    if (msg.sender != operator && msg.sender != bookManager) revert NotTradingController();
     _;
   }
 
-  /// @notice One-shot setup of a (proxy) pool. Original 0x67107049.
-  /// @dev NOT access controlled in the original: whoever calls first wins, so a proxy has to be initialised in the
-  ///      same transaction that deploys it. The default fee starts at 0 (it shares a slot with the operator address).
-  function initialize(
-    address _multiSigOwner,
-    address _poolManager,
-    address _operator,
-    address _baseToken,
-    address _quoteToken,
-    uint8 _baseDecimals,
-    uint8 _quoteDecimals
-  ) external {
-    if (isInitialized) revert AlreadyInitialized();
-
-    poolManager = _poolManager;
-    baseToken = _baseToken;
-    quoteToken = _quoteToken;
-    baseDecimals = _baseDecimals;
-    quoteDecimals = _quoteDecimals;
-    operator = _operator;
-    multiSigOwner = _multiSigOwner;
-
-    tradingEnabled = true;
-    isInitialized = true;
-  }
-
   /*////////////////////////////////////////////////////////////
-                              VIEW BOOK DATA
+                       EXTERNAL VIEW FUNCTIONS
   ////////////////////////////////////////////////////////////*/
 
-  /// @notice Top-of-book price. Ask: rounded UP, bid: rounded DOWN, i.e. both roundings favour the pool.
+  /// @notice Top-of-book price. Ask: rounded UP, bid: rounded DOWN, i.e. both roundings favour the book.
   function bestPrice(bool _isBid)
     public
     view
@@ -160,16 +135,12 @@ contract TesseraBook is ITesseraBook {
     return clob.bids;
   }
 
-  /*////////////////////////////////////////////////////////////
-                        VIEW BOOK WALKS
-  ////////////////////////////////////////////////////////////*/
-
   /// @notice Gross output (before fees) for selling `_amountIn` into the book; 0 if the book cannot absorb it.
   /// @param _takeBidSide true: taker pays base, receives quote, trades against `bids`.
   ///                     false: taker pays quote, receives base, trades against `asks`.
   function bookWalkExactIn(bool _takeBidSide, uint256 _amountIn) public view returns (uint256 _grossOutput) {
     if (!tradingEnabled) revert TradingDisabled();
-    if (!IPoolManager(poolManager).isActive()) revert PoolManagerInactive();
+    if (!IBookManager(bookManager).isActive()) revert BookManagerInactive();
 
     (
       bool _ok,
@@ -234,7 +205,7 @@ contract TesseraBook is ITesseraBook {
   /// @param _takeBidSide same meaning as in bookWalkExactIn.
   function bookWalkExactOut(bool _takeBidSide, uint256 _grossAmountOut) public view returns (uint256 _amountIn) {
     if (!tradingEnabled) revert TradingDisabled();
-    if (!IPoolManager(poolManager).isActive()) revert PoolManagerInactive();
+    if (!IBookManager(bookManager).isActive()) revert BookManagerInactive();
 
     (
       bool _ok,
@@ -276,7 +247,7 @@ contract TesseraBook is ITesseraBook {
 
       if (_remainingOutput < _levelMaxOutput) {
         // The order ends inside this level: pay only for what we still need.
-        // TODO: round UP (original: ceil, `(x + d - 1) / d`) so the pool never undercharges.
+        // TODO: round UP (original: ceil, `(x + d - 1) / d`) so the book never undercharges.
         _amountIn += _remainingOutput * WAD / _levelPrice;
         _remainingOutput = 0;
         break;
@@ -292,19 +263,96 @@ contract TesseraBook is ITesseraBook {
     if (_remainingOutput != 0) return NOT_FILLABLE; // not enough depth
   }
 
+  // What the original previews (0x21523c7e / 0x43db5616) do differently from the swaps:
+  //   - they take NO `data` argument, so there is no fee mode: previews carry no mode fee at all (not even what the
+  //     helper returns for mode 0). A swap that passes a nonzero mode byte can therefore differ from its preview.
+  //   - same gate as the swaps: only the book manager may call them (T17 / T16 / T4).
+  //   - they never revert for "cannot fill": exact-in returns 0, exact-out returns NOT_FILLABLE (uint256.max).
+  //     (They still revert for the checks above, for a blacklisted caller, and on a bad multiplier.)
+  //   - no zero-amount check and no zero-result check.
+
+  /// @notice Net output `sell` would give right now, or 0 if it cannot fill / the quote is expired.
+  function previewSell(
+    bool _takeBidSide,
+    uint256 _amountIn,
+    address _sender
+  ) external view returns (uint256 _netOutput) {
+    _requireSwapAllowed();
+
+    // Same order as the original: walk first, fee second (the fee check runs even if the walk found no depth).
+    uint256 _grossOutput = bookWalkExactIn(_takeBidSide, _amountIn);
+
+    (bool _rejected, uint256 _feePpm) = _computeFee(_sender, quote.refBlock, 0);
+    if (_rejected) return 0; // quote expired
+
+    _netOutput = _grossOutput * (PPM - _feePpm) / PPM;
+  }
+
+  /// @notice Input `buy` would charge right now for exactly `_amountOut`, or NOT_FILLABLE (uint256.max) if it cannot fill.
+  /// @dev NOT_FILLABLE covers: no quote on this side, expired quote, fee that cannot be grossed up, too little depth.
+  function previewBuy(
+    bool _takeBidSide,
+    uint256 _amountOut,
+    address _sender
+  ) external view returns (uint256 _netInput) {
+    _requireSwapAllowed();
+
+    (bool _hasQuote,,, uint40 _refBlock,) = bestPrice(_takeBidSide);
+    if (!_hasQuote) return NOT_FILLABLE; // (the fee is not even computed in this case)
+
+    (bool _rejected, uint256 _feePpm) = _computeFee(_sender, _refBlock, 0);
+    if (_rejected) return NOT_FILLABLE;
+
+    uint256 _grossAmountOut = _grossUpForFee(_amountOut, _feePpm);
+    if (_grossAmountOut == NOT_FILLABLE) return NOT_FILLABLE;
+
+    _netInput = bookWalkExactOut(_takeBidSide, _grossAmountOut);
+  }
+
+  /// @notice Off-chain helper: builds the `_encoded` argument of setDefaultFee.
+  function encodeDefaultFeeUpdate(uint32 _fee, uint64 _blockNumber) external pure returns (uint96) {
+    uint96 _decoded = (uint96(_fee) << 64) | _blockNumber;
+    return DEFAULT_FEE_KEY ^ ~_decoded;
+  }
+
   /*////////////////////////////////////////////////////////////
-                              SWAPS
+                       EXTERNAL WRITE FUNCTIONS
   ////////////////////////////////////////////////////////////*/
 
+  /// @notice One-shot setup of a (proxy) book. Original 0x67107049.
+  /// @dev NOT access controlled in the original: whoever calls first wins, so a proxy has to be initialized in the
+  ///      same transaction that deploys it (the proxy constructor does). The default fee starts at 0 (it shares a
+  ///      slot with the operator address).
+  function initialize(
+    address _multiSigOwner,
+    address _bookManager,
+    address _operator,
+    address _baseToken,
+    address _quoteToken,
+    uint8 _baseDecimals,
+    uint8 _quoteDecimals
+  ) external {
+    if (isInitialized) revert AlreadyInitialized();
+
+    bookManager = _bookManager;
+    baseToken = _baseToken;
+    quoteToken = _quoteToken;
+    baseDecimals = _baseDecimals;
+    quoteDecimals = _quoteDecimals;
+    operator = _operator;
+    multiSigOwner = _multiSigOwner;
+
+    tradingEnabled = true;
+    isInitialized = true;
+  }
+
   /// @notice Exact-input swap. Returns the NET output (after fees).
-  /// @dev No token transfers happen here: the pool only prices the trade and books it into the flow accumulators.
-  ///      Settlement is up to the caller (the pool manager / router).
-  /// @dev The original returns the plain unsigned amount. The negated ("signed delta") values I mentioned earlier
-  ///      only show up around the event in the decompilation, not in the return value.
+  /// @dev No token transfers happen here: the book only prices the trade and books it into the flow accumulators.
+  ///      Settlement is up to the router (it pays from the treasury and pulls the input).
   /// @param _takeBidSide true: taker sells base into `bids`; false: taker sells quote into `asks`.
   /// @param _sender the contract that called the router (TesseraSwap's `msg.sender`), forwarded by the engine.
   ///        The fee uses it, together with tx.origin, for the address checks (paper, App. C.2).
-  ///        It is NOT the token recipient: the pool never sees that address.
+  ///        It is NOT the token recipient: the book never sees that address.
   /// @param _data first byte = fee "mode" (0 if empty).
   function sell(
     bool _takeBidSide,
@@ -364,64 +412,134 @@ contract TesseraBook is ITesseraBook {
     _recordSwap(_takeBidSide, _sender, _amountIn, _amountOut, _tag, _mode);
   }
 
+  /// @notice Replaces the whole book (both ladders) and starts the flow netting from scratch. Original 0xdba310cf
+  ///         (~152k gas in the paper). It does NOT touch the quote: anchor / spread / refBlock / tag have their own,
+  ///         cheaper raw-calldata path (~27k gas) in the proxy.
+  /// @dev Steps, in the original order:
+  ///        1. operator only
+  ///        2. at most 19 levels per side (index 19 is reserved for the terminator)
+  ///        3. zero both flow accumulators (a fresh book starts with nothing depleted)
+  ///        4. write the bid levels, then a terminator
+  ///        5. write the ask levels, then a terminator
+  ///      Deliberately absent (as in the original): no check that multipliers decrease, that liquidity is non-zero,
+  ///      or that the input levels do not carry `endOfBook = true`. A bad book is only caught by the walk
+  ///      (swaps / quotes revert), so the operator is trusted. Levels after the terminator are NOT cleared:
+  ///      stale data stays in storage but is never read.
+  function updateBook(BookUpdate calldata _book) external onlyOperator {
+    if (_book.bids.length > MAX_LEVELS_PER_UPDATE || _book.asks.length > MAX_LEVELS_PER_UPDATE) {
+      revert TooManyOrders();
+    }
+
+    baseFlowAccumulator = 0;
+    quoteFlowAccumulator = 0;
+
+    _writeLadder(clob.bids, _book.bids);
+    _writeLadder(clob.asks, _book.asks);
+  }
+
+  /// @notice The operator's full parameter update. Original 0x75e8422f. Does not touch the accumulators or the ladders.
+  function configure(BookConfig calldata _config) external onlyOperator {
+    _checkLimits(_config.baseFee, _config.freshness.ageFeeCap, _config.factor);
+    _storeConfig(_config);
+    excludedBestLevels = _config.excludedBestLevels;
+    fingerprintHelper = _config.fingerprintHelper;
+  }
+
+  /// @notice Book manager only. Original 0x209dab1e: the engine calls it right after deploying the book proxy.
+  /// @dev Same checks and writes as `configure`, except `excludedBestLevels` and the fingerprint helper, plus: both
+  ///      flow accumulators are RESET and the two tokens must be non-zero and different. The tokens and decimals
+  ///      are not stored again (`initialize` did it), and `updaters` / `operator` are ignored here.
+  ///      The middle fields of `ITesseraEngine.BookParams` are mapped from types, see there.
+  function reconfigure(ITesseraEngine.BookParams calldata _params) external {
+    if (!IBookManager(bookManager).isActive()) revert BookManagerInactive();
+    if (msg.sender != bookManager) revert CallerNotBookManager();
+
+    if (_params.baseToken == address(0) || _params.quoteToken == address(0) || _params.baseToken == _params.quoteToken)
+    {
+      revert InvalidAddresses();
+    }
+    _checkLimits(_params.baseFee, _params.ageFeeCap, _params.factor);
+
+    baseFlowAccumulator = 0;
+    quoteFlowAccumulator = 0;
+
+    // `excludedBestLevels` and `fingerprintHelper` are not written by `_storeConfig`, so their values here are unused.
+    _storeConfig(
+      BookConfig({
+        baseFee: uint24(_params.baseFee), // <= 1e6, fits
+        factor: uint24(_params.factor),
+        excludedBestLevels: excludedBestLevels,
+        nettingEnabled: _params.nettingEnabled,
+        freshness: QuoteFreshness({
+          blocksExpiryAge: _params.blocksExpiryAge,
+          blocksGracePeriod: _params.blocksGracePeriod,
+          quadraticCoeff: _params.quadraticCoeff,
+          ageFeeCap: _params.ageFeeCap
+        }),
+        addressFee: _params.addressFee,
+        whitelistOnly: _params.whitelistOnly,
+        priorityMultiplierPpm: _params.priorityMultiplierPpm,
+        priorityFee: _params.priorityFee,
+        fingerprintHelper: fingerprintHelper
+      })
+    );
+  }
+
+  /// @notice Sets the DEFAULT fee for the current block. Original 0x1667d875.
+  /// @dev The argument is obfuscated and block-bound:  decoded = ~(KEY ^ encoded), a uint96 =
+  ///        [ fee (32 bits) | block number (64 bits) ]
+  ///      and the update only goes through if the block number inside it is the current one, so a late
+  ///      transaction can never apply an old fee. The operator flips this at the start and the end of every block
+  ///      (paper, Sec. 7.4 "spoofing"): a high fee while trades are executed, a low one at the end of the block,
+  ///      which is the state aggregators read when they route.
+  /// @dev On a wrong block: Dedaub shows a silent no-op, heimdall shows a bare revert (empty data). I chose revert
+  ///      (matches a plain `require`). Check a failed 0x1667d875 transaction on BaseScan to settle it.
+  function setDefaultFee(uint96 _encoded) external onlyOperator {
+    uint96 _decoded = ~(DEFAULT_FEE_KEY ^ _encoded);
+    if (uint64(block.number) != uint64(_decoded)) revert StaleDefaultFeeUpdate();
+    defaultFee = uint32(_decoded >> 64);
+  }
+
+  /// @notice Operator sets the helper that prices the mode byte. Original 0x7bcffd54 (no zero-address check).
+  function setModeFeeHelper(address _helper) external onlyOperator {
+    modeFeeHelper = _helper;
+  }
+
+  function enableTrading() external onlyTradingController {
+    tradingEnabled = true;
+  }
+
+  function disableTrading() external onlyTradingController {
+    tradingEnabled = false;
+  }
+
+  /// @notice Multisig-only withdrawal of stray tokens. Original 0x2c88026b ("rescueTokensss1337").
+  function rescueTokens(address[] calldata _tokens, uint256[] calldata _amounts, address _to) external onlyMultiSig {
+    if (_tokens.length != _amounts.length) revert LengthMismatch();
+
+    for (uint256 _i; _i < _tokens.length; ++_i) {
+      // TODO: use OpenZeppelin's SafeERC20.
+      (bool _ok, bytes memory _ret) = _tokens[_i].call(abi.encodeWithSelector(bytes4(0xa9059cbb), _to, _amounts[_i]));
+      bool _success = _ok && (_ret.length == 0 ? _tokens[_i].code.length != 0 : abi.decode(_ret, (bool)));
+      if (!_success) revert TransferFailed(_tokens[_i]);
+    }
+  }
+
+  /// @notice Multisig-only withdrawal of native ETH. Original 0x8f05e71b ("rescueEthhh1337").
+  function rescueEth(uint256 _amount, address _to) external onlyMultiSig {
+    (bool _ok,) = _to.call{value: _amount}('');
+    require(_ok);
+  }
+
   /*////////////////////////////////////////////////////////////
-                             PREVIEWS
+                    PRIVATE / INTERNAL FUNCTIONS
   ////////////////////////////////////////////////////////////*/
 
-  // What the original previews (0x21523c7e / 0x43db5616) do differently from the swaps:
-  //   - they take NO `data` argument, so there is no fee mode: previews carry no mode fee at all (not even what the helper returns for mode 0).
-  //     A swap that passes a nonzero mode byte can therefore differ from its preview.
-  //   - same gate as the swaps: only the pool manager may call them (T17 / T16 / T4).
-  //   - they never revert for "cannot fill": exact-in returns 0, exact-out returns NOT_FILLABLE (uint256.max).
-  //     (They still revert for the checks above, for a blacklisted caller, and on a bad multiplier.)
-  //   - no zero-amount check and no zero-result check.
-
-  /// @notice Net output `sell` would give right now, or 0 if it cannot fill / the quote is expired.
-  /// @dev `_data` is kept to match the interface; the original has no such argument and ignores the mode.
-  function previewSell(
-    bool _takeBidSide,
-    uint256 _amountIn,
-    address _sender,
-    bytes calldata /* _data */
-  ) external view returns (uint256 _netOutput) {
-    _requireSwapAllowed();
-
-    // Same order as the original: walk first, fee second (the fee check runs even if the walk found no depth).
-    uint256 _grossOutput = bookWalkExactIn(_takeBidSide, _amountIn);
-
-    (bool _rejected, uint256 _feePpm) = _computeFee(_sender, quote.refBlock, 0);
-    if (_rejected) return 0; // quote expired
-
-    _netOutput = _grossOutput * (PPM - _feePpm) / PPM;
-  }
-
-  /// @notice Input `buy` would charge right now for exactly `_amountOut`, or NOT_FILLABLE (uint256.max) if it cannot fill.
-  /// @dev NOT_FILLABLE covers: no quote on this side, expired quote, fee that cannot be grossed up, too little depth.
-  function previewBuy(
-    bool _takeBidSide,
-    uint256 _amountOut,
-    address _sender,
-    bytes calldata /* _data */
-  ) external view returns (uint256 _netInput) {
-    _requireSwapAllowed();
-
-    (bool _hasQuote,,, uint40 _refBlock,) = bestPrice(_takeBidSide);
-    if (!_hasQuote) return NOT_FILLABLE; // (the fee is not even computed in this case)
-
-    (bool _rejected, uint256 _feePpm) = _computeFee(_sender, _refBlock, 0);
-    if (_rejected) return NOT_FILLABLE;
-
-    uint256 _grossAmountOut = _grossUpForFee(_amountOut, _feePpm);
-    if (_grossAmountOut == NOT_FILLABLE) return NOT_FILLABLE;
-
-    _netInput = bookWalkExactOut(_takeBidSide, _grossAmountOut);
-  }
-
-  /// @dev Checks shared by both swaps AND both previews, in the original order. Only the POOL MANAGER may call any of them.
+  /// @dev Checks shared by both swaps AND both previews, in the original order. Only the BOOK MANAGER may call any of them.
   function _requireSwapAllowed() private view {
     if (!tradingEnabled) revert TradingDisabled(); // T17
-    if (!IPoolManager(poolManager).isActive()) revert PoolManagerInactive(); // T16
-    if (msg.sender != poolManager) revert CallerNotPoolManager(); // T4
+    if (!IBookManager(bookManager).isActive()) revert BookManagerInactive(); // T16
+    if (msg.sender != bookManager) revert CallerNotBookManager(); // T4
   }
 
   /// @dev Fee "mode" is the first byte of `data`; empty data means mode 0.
@@ -442,8 +560,8 @@ contract TesseraBook is ITesseraBook {
   ) private {
     emit Swap(_sender, _amountIn, _amountOut, baseToken, quoteToken, _tag, baseFlowAccumulator, quoteFlowAccumulator);
 
-    // The accumulator of the side that was HIT grows by the taker's INPUT (base on bids, quote on asks), scaled by `factor`.
-    // This is the same unit the book walk subtracts from the levels. (The iface comment says "output * factor": see notes.)
+    // The accumulator of the side that was HIT grows by the taker's INPUT (base on bids, quote on asks), scaled by
+    // `factor`. This is the same unit the book walk subtracts from the levels (inferred, see the open questions).
     uint256 _flowDelta = _amountIn * factor / PPM;
     if (_takeBidSide) baseFlowAccumulator += _flowDelta;
     else quoteFlowAccumulator += _flowDelta;
@@ -459,10 +577,6 @@ contract TesseraBook is ITesseraBook {
     if (_feePpm >= PPM || _netAmountOut > type(uint256).max / PPM) return NOT_FILLABLE;
     return _netAmountOut * PPM / (PPM - _feePpm);
   }
-
-  /*////////////////////////////////////////////////////////////
-                              FEES
-  ////////////////////////////////////////////////////////////*/
 
   // The original contains ONE fee function, emitted four times (0x15bb, 0x2aa6, 0x34e5, 0x3786). The copies differ
   // only in whether the mode fee is part of the sum: swaps include it, previews do not.
@@ -486,12 +600,12 @@ contract TesseraBook is ITesseraBook {
     if (_ageFee == NO_FILL) return (true, 0);
 
     // 2. Who is trading? The manager's registry labels both the calling contract and the EOA behind the transaction.
-    IPoolManager.AddressLabel _senderLabel = IPoolManager(poolManager).addressLabel(_sender);
-    IPoolManager.AddressLabel _originLabel = IPoolManager(poolManager).addressLabel(tx.origin);
+    IBookManager.AddressLabel _senderLabel = IBookManager(bookManager).addressLabel(_sender);
+    IBookManager.AddressLabel _originLabel = IBookManager(bookManager).addressLabel(tx.origin);
 
     // 3. Default fee: waived if EITHER address is default-exempt.
-    uint256 _defaultFee = (_senderLabel == IPoolManager.AddressLabel.DefaultExempt
-        || _originLabel == IPoolManager.AddressLabel.DefaultExempt)
+    uint256 _defaultFee = (_senderLabel == IBookManager.AddressLabel.DefaultExempt
+        || _originLabel == IBookManager.AddressLabel.DefaultExempt)
       ? 0
       : defaultFee;
 
@@ -524,7 +638,7 @@ contract TesseraBook is ITesseraBook {
   ///      i.e. that try to land ahead of the operator's quote update at the start of the block.
   ///      A single configured value; the two spikes (2 and 5 bps) in the paper are most likely two config epochs.
   function _priorityFeePpm() private view returns (uint256) {
-    uint256 _threshold = IPoolManager(poolManager).priorityFeeReference() * priorityMultiplierPpm / PPM;
+    uint256 _threshold = IBookManager(bookManager).priorityFeeReference() * priorityMultiplierPpm / PPM;
     uint256 _effectivePriorityFee = tx.gasprice < block.basefee ? 0 : tx.gasprice - block.basefee;
     return _effectivePriorityFee > _threshold ? priorityFee : 0;
   }
@@ -538,22 +652,22 @@ contract TesseraBook is ITesseraBook {
   ///      The original also burns ~500 iterations of memory allocation on the penalized branch (see the gas-loop notes).
   function _addressFeePpm(
     address _sender,
-    IPoolManager.AddressLabel _senderLabel,
-    IPoolManager.AddressLabel _originLabel
+    IBookManager.AddressLabel _senderLabel,
+    IBookManager.AddressLabel _originLabel
   ) private view returns (uint256) {
     if (whitelistOnly) {
-      if (_senderLabel != IPoolManager.AddressLabel.DefaultExempt) {
+      if (_senderLabel != IBookManager.AddressLabel.DefaultExempt) {
         revert AddressNotWhitelisted();
       }
       return 0;
     }
 
-    if (_senderLabel == IPoolManager.AddressLabel.Blacklisted || _originLabel == IPoolManager.AddressLabel.Blacklisted)
+    if (_senderLabel == IBookManager.AddressLabel.Blacklisted || _originLabel == IBookManager.AddressLabel.Blacklisted)
     {
       revert AddressBlacklisted();
     }
 
-    if (_senderLabel == IPoolManager.AddressLabel.Penalized || _originLabel == IPoolManager.AddressLabel.Penalized) {
+    if (_senderLabel == IBookManager.AddressLabel.Penalized || _originLabel == IBookManager.AddressLabel.Penalized) {
       return addressFee;
     }
 
@@ -589,10 +703,6 @@ contract TesseraBook is ITesseraBook {
     uint256 _fee = abi.decode(_ret, (uint256));
     return _fee > PPM ? PPM : _fee;
   }
-
-  /*////////////////////////////////////////////////////////////
-                SHARED SETUP FOR BOTH WALKS (new helper)
-  ////////////////////////////////////////////////////////////*/
 
   /// @dev Everything that differs between the two directions, decided once. Pulled out of bookWalkExactIn so
   ///      that both walks share it (the original decompilation duplicated this block in four places).
@@ -638,7 +748,7 @@ contract TesseraBook is ITesseraBook {
       _netDepletion = _currentSideFlow > _oppositeFlowInOwnUnits ? _currentSideFlow - _oppositeFlowInOwnUnits : 0;
     }
 
-    _excludedLevels = block.number < IPoolManager(poolManager).levelExclusionDeadlineBlock() ? excludedBestLevels : 0;
+    _excludedLevels = block.number < IBookManager(bookManager).levelExclusionDeadlineBlock() ? excludedBestLevels : 0;
     _ok = true;
   }
 
@@ -646,10 +756,6 @@ contract TesseraBook is ITesseraBook {
   function side(BookLevel[MAX_BOOK_LEVELS] storage _side, uint256 _i) private view returns (BookLevel memory) {
     return _side[_i];
   }
-
-  /*////////////////////////////////////////////////////////////
-                  PRICE HELPERS
-  ////////////////////////////////////////////////////////////*/
 
   /// @dev 1e36 / price: "quote per base" <-> "base per quote", both 1e18 fixed point.
   function _invert(uint128 _price) private pure returns (uint128) {
@@ -677,35 +783,6 @@ contract TesseraBook is ITesseraBook {
     return _wholeTokenPrice / 10 ** (_q - _b);
   }
 
-  /*////////////////////////////////////////////////////////////
-                           BOOK UPDATE
-  ////////////////////////////////////////////////////////////*/
-
-  /// @notice Replaces the whole book (both ladders) and starts the flow netting from scratch. Original 0xdba310cf
-  ///         (~152k gas in the paper). It does NOT touch the quote: anchor / spread / refBlock / tag have their own,
-  ///         cheaper raw-calldata path (~27k gas).
-  /// @dev Steps, in the original order:
-  ///        1. operator only
-  ///        2. at most 19 levels per side (index 19 is reserved for the terminator)
-  ///        3. zero both flow accumulators (a fresh book starts with nothing depleted)
-  ///        4. write the bid levels, then a terminator
-  ///        5. write the ask levels, then a terminator
-  ///      Deliberately absent (as in the original): no check that multipliers decrease, that liquidity is non-zero,
-  ///      or that the input levels do not carry `endOfBook = true`. A bad book is only caught by the walk
-  ///      (swaps / quotes revert), so the operator is trusted. Levels after the terminator are NOT cleared:
-  ///      stale data stays in storage but is never read.
-  function updateBook(BookUpdate calldata _book) external onlyOperator {
-    if (_book.bids.length > MAX_LEVELS_PER_UPDATE || _book.asks.length > MAX_LEVELS_PER_UPDATE) {
-      revert TooManyOrders();
-    }
-
-    baseFlowAccumulator = 0;
-    quoteFlowAccumulator = 0;
-
-    _writeLadder(clob.bids, _book.bids);
-    _writeLadder(clob.asks, _book.asks);
-  }
-
   /// @dev Copies `_levels` into the front of `_ladder` and caps it with a terminator: one SSTORE per level plus one
   ///      for the terminator. (The decompiled bit-twiddling is exactly Solidity's packing of {uint160, uint64, bool}.)
   function _writeLadder(BookLevel[MAX_BOOK_LEVELS] storage _ladder, BookLevel[] calldata _levels) private {
@@ -718,103 +795,22 @@ contract TesseraBook is ITesseraBook {
     _ladder[_count] = BookLevel({liquidity: 0, multiplier: 0, endOfBook: true});
   }
 
-  /*////////////////////////////////////////////////////////////
-                         ADMIN AND CONFIG
-  ////////////////////////////////////////////////////////////*/
-
-  function enableTrading() external onlyTradingController {
-    tradingEnabled = true;
-  }
-
-  function disableTrading() external onlyTradingController {
-    tradingEnabled = false;
-  }
-
-  /// @notice Sets the DEFAULT fee for the current block. Original 0x1667d875.
-  /// @dev The argument is obfuscated and block-bound:  decoded = ~(KEY ^ encoded), a uint96 =
-  ///        [ fee (32 bits) | block number (64 bits) ]
-  ///      and the update only goes through if the block number inside it is the current one, so a late
-  ///      transaction can never apply an old fee. The operator flips this at the start and the end of every block
-  ///      (paper, Sec. 7.4 "spoofing"): a high fee while trades are executed, a low one at the end of the block,
-  ///      which is the state aggregators read when they route.
-  /// @dev On a wrong block: Dedaub shows a silent no-op, heimdall shows a bare revert (empty data). I chose revert
-  ///      (matches a plain `require`). Check a failed 0x1667d875 transaction on BaseScan to settle it.
-  function setDefaultFee(uint96 _encoded) external onlyOperator {
-    uint96 _decoded = ~(DEFAULT_FEE_KEY ^ _encoded);
-    if (uint64(block.number) != uint64(_decoded)) revert StaleDefaultFeeUpdate();
-    defaultFee = uint32(_decoded >> 64);
-  }
-
-  /// @notice Off-chain helper: builds the `_encoded` argument of setDefaultFee.
-  function encodeDefaultFeeUpdate(uint32 _fee, uint64 _blockNumber) external pure returns (uint96) {
-    uint96 _decoded = (uint96(_fee) << 64) | _blockNumber;
-    return DEFAULT_FEE_KEY ^ ~_decoded;
-  }
-
-  /// @notice Operator sets the helper that prices the mode byte. Original 0x7bcffd54 (no zero-address check).
-  function setModeFeeHelper(address _helper) external onlyOperator {
-    modeFeeHelper = _helper;
-  }
-
-  /// @notice The operator's full parameter update. Original 0x75e8422f. Does not touch the accumulators or the book.
-  function configure(PoolConfig calldata _c) external onlyOperator {
-    _checkLimits(_c);
-    _storeConfig(_c);
-    excludedBestLevels = _c.excludedBestLevels;
-    fingerprintHelper = _c.fingerprintHelper;
-  }
-
-  /// @notice PARTIALLY UNDERSTOOD. Original 0x209dab1e, callable only by the pool manager (after the same isActive() check).
-  /// @dev What the decompilation shows: two address arguments that must be non-zero and different from each other
-  ///      (never stored; probably the token pair, unverified); the same fee limits as `configure`; both flow
-  ///      accumulators are RESET; and the same parameters as `configure` are written, except `excludedBestLevels`
-  ///      and the fingerprint helper. But the real calldata is 26 words and the decompiler decodes only 13, so the
-  ///      real signature is probably different. Decode the calldata of a real call from the manager before relying on this.
-  function reconfigure(address _addressA, address _addressB, PoolConfig calldata _c) external {
-    if (!IPoolManager(poolManager).isActive()) revert PoolManagerInactive();
-    if (msg.sender != poolManager) revert CallerNotPoolManager();
-
-    if (_addressA == address(0) || _addressB == address(0) || _addressA == _addressB) revert InvalidAddresses();
-    _checkLimits(_c);
-
-    baseFlowAccumulator = 0;
-    quoteFlowAccumulator = 0;
-    _storeConfig(_c);
-  }
-
   /// @dev Only these three values are range-checked. The address, priority and default fees are not (the total is
   ///      capped at 1e6 when it is computed).
-  function _checkLimits(PoolConfig calldata _c) private pure {
-    if (_c.baseFee > PPM || _c.freshness.ageFeeCap > PPM) revert FeeAbove100Percent();
-    if (_c.factor > PPM) revert FactorAbove100Percent();
+  function _checkLimits(uint256 _baseFee, uint256 _ageFeeCap, uint256 _factor) private pure {
+    if (_baseFee > PPM || _ageFeeCap > PPM) revert FeeAbove100Percent();
+    if (_factor > PPM) revert FactorAbove100Percent();
   }
 
-  function _storeConfig(PoolConfig calldata _c) private {
-    baseFee = _c.baseFee;
-    factor = _c.factor;
-    nettingEnabled = _c.nettingEnabled;
-    quoteFreshness = _c.freshness;
-    addressFee = _c.addressFee;
-    whitelistOnly = _c.whitelistOnly;
-    priorityMultiplierPpm = _c.priorityMultiplierPpm;
-    priorityFee = _c.priorityFee;
-  }
-
-  /// @notice Multisig-only withdrawal of stray tokens. Original 0x2c88026b ("rescueTokensss1337").
-  function rescueTokens(address[] calldata _tokens, uint256[] calldata _amounts, address _to) external onlyMultiSig {
-    if (_tokens.length != _amounts.length) revert LengthMismatch();
-
-    for (uint256 _i; _i < _tokens.length; ++_i) {
-      // TODO: use OpenZeppelin's SafeERC20.
-      (bool _ok, bytes memory _ret) = _tokens[_i].call(abi.encodeWithSelector(bytes4(0xa9059cbb), _to, _amounts[_i]));
-      bool _success = _ok && (_ret.length == 0 ? _tokens[_i].code.length != 0 : abi.decode(_ret, (bool)));
-      if (!_success) revert TransferFailed(_tokens[_i]);
-    }
-  }
-
-  /// @notice Multisig-only withdrawal of native ETH. Original 0x8f05e71b ("rescueEthhh1337").
-  function rescueEth(uint256 _amount, address _to) external onlyMultiSig {
-    (bool _ok,) = _to.call{value: _amount}('');
-    require(_ok);
+  /// @dev Writes the parameters shared by `configure` and `reconfigure` (NOT `excludedBestLevels` / `fingerprintHelper`).
+  function _storeConfig(BookConfig memory _config) private {
+    baseFee = _config.baseFee;
+    factor = _config.factor;
+    nettingEnabled = _config.nettingEnabled;
+    quoteFreshness = _config.freshness;
+    addressFee = _config.addressFee;
+    whitelistOnly = _config.whitelistOnly;
+    priorityMultiplierPpm = _config.priorityMultiplierPpm;
+    priorityFee = _config.priorityFee;
   }
 }

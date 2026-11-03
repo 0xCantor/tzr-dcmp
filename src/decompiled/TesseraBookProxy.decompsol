@@ -1,0 +1,111 @@
+contract Decompiled {
+    // Decompiled by library.dedaub.com
+// 2026.10.08 14:24 UTC
+// Compiled using the solidity compiler version 0.8.30
+
+
+    // Data structures and variables inferred from the use of storage instructions
+    uint256 ___function_selector__; // STORAGE[0x0]
+    address stor_360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc_0_19; // STORAGE[0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc] bytes 0 to 19
+
+
+    // Events
+    Upgraded(address);
+
+    function 0xa9977bfe() public nonPayable {
+        require(msg.data.length - 4 >= 0);
+        return ___function_selector__;
+    }
+
+    // Note: The function selector is not present in the original solidity code.
+    // However, we display it for the sake of completeness.
+
+    function __function_selector__(bytes4 function_selector, address varg1, uint256 varg2) public payable {
+        MEM[64] = 128;
+        if (msg.data.length >= 4) {
+            if (!(0xa9977bfe - (function_selector >> 224))) {
+                0xa9977bfe();
+            }
+        }
+        v0 = v1 = msg.sender == address(0x2744e8f08cd7f0ba46530420bf38fc7476e9e754);
+        if (msg.sender != address(0x2744e8f08cd7f0ba46530420bf38fc7476e9e754)) {
+            v0 = v2 = msg.sender == address(0x2913814212d15889a7fe91ef5b17c7530074146c);
+        }
+        if (!v0) {
+            v0 = v3 = msg.sender == address(0x4911eb2cf514f8e600d0749b415f7e4c1e75e70e);
+        }
+        if (!v0) {
+            v0 = v4 = msg.sender == address(0x825c1ccbf3b65052f2484162c5abf22df4f02480);
+        }
+        if (!v0) {
+            v0 = v5 = msg.sender == address(0xd4396d6159e35bf3d5b64453ae7d272127e54d21);
+        }
+        if (!v0) {
+            v0 = v6 = msg.sender == address(0x41167f171fec544d285e2f122078f7034ff8b474);
+        }
+        if (!v0) {
+            v0 = v7 = msg.sender == address(0x5ec4e681249b29df991bc8cfc45f35326e9ea416);
+        }
+        if (!v0) {
+            v0 = v8 = msg.sender == address(0x7c8fa49c9012fa32b9e7e14f5e6782895c7c88d1);
+        }
+        if (!v0) {
+            v0 = v9 = msg.sender == address(0xa6286e0646d55cade61c3a40508815960c5f17d8);
+        }
+        if (!v0) {
+            v0 = v10 = msg.sender == address(0xcce5b80a78d9b2d0232e1c6ec83eb7cf470238d6);
+        }
+        if (!v0) {
+            if (!(address(0x31e99e05fee3dce580af777c3fd63ee1b3b40c17) - msg.sender)) {
+                if (!(0 - (function_selector != 0x4f1ef28600000000000000000000000000000000000000000000000000000000))) {
+                    require(4 <= msg.data.length);
+                    require(msg.data.length - 4 >= 64);
+                    require(varg2 <= uint64.max);
+                    require(varg2 + 35 < msg.data.length);
+                    require(varg2.length <= uint64.max, Panic(65)); // failed memory allocation (too much memory)
+                    v11 = new bytes[](varg2.length);
+                    require(!((v11 + (32 + (0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0 & 31 + varg2.length) + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (v11 + (32 + (0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0 & 31 + varg2.length) + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < v11)), Panic(65)); // failed memory allocation (too much memory)
+                    require(varg2 + varg2.length + 36 <= msg.data.length);
+                    CALLDATACOPY(v11.data, varg2.data, varg2.length);
+                    v11[varg2.length] = 0;
+                    require(varg1.code.size, ERC1967InvalidImplementation(varg1));
+                    stor_360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc_0_19 = varg1;
+                    emit Upgraded(varg1);
+                    if (!v11.length) {
+                        require(!msg.value, ERC1967NonPayable());
+                    } else {
+                        v12, /* uint256 */ v13 = varg1.delegatecall(MEM[v46bV0x42d4V0x136.data:v46bV0x42d4V0x136.data + v46bV0x42d4V0x136.length], MEM[0:0]).gas(msg.gas);
+                        if (!RETURNDATASIZE()) {
+                            v14 = v15 = 96;
+                        } else {
+                            require(RETURNDATASIZE() <= uint64.max, Panic(65)); // failed memory allocation (too much memory)
+                            v14 = new bytes[](RETURNDATASIZE());
+                            require(!((v14 + (32 + (0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0 & 31 + RETURNDATASIZE()) + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (v14 + (32 + (0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0 & 31 + RETURNDATASIZE()) + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < v14)), Panic(65)); // failed memory allocation (too much memory)
+                            v13 = v14.data;
+                            RETURNDATACOPY(v13, 0, RETURNDATASIZE());
+                        }
+                        if (v12) {
+                            v16 = v17 = !MEM[v14];
+                            if (v17) {
+                                v16 = v18 = !varg1.code.size;
+                            }
+                            require(!v16, AddressEmptyCode(varg1));
+                        } else {
+                            require(!MEM[v14], v14 + 32, MEM[v14]);
+                            revert(FailedCall());
+                        }
+                    }
+                    exit;
+                }
+            }
+            CALLDATACOPY(0, 0, msg.data.length);
+            v19 = stor_360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc_0_19.delegatecall(MEM[0:msg.data.length], MEM[0:0]).gas(msg.gas);
+            require(v19, 0, RETURNDATASIZE()); // checks call status, propagates error data on error
+            return MEM[0:RETURNDATASIZE()];
+        } else {
+            require(!(!uint8((byte(function_selector, 0x0)) - (byte(___function_selector__, 0x0))) | (uint8((byte(function_selector, 0x0)) - (byte(___function_selector__, 0x0))) > 15)));
+            ___function_selector__ = function_selector;
+            exit;
+        }
+    }
+}
