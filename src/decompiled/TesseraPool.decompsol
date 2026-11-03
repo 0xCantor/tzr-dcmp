@@ -1,0 +1,2969 @@
+// =====================================================================================
+// ANNOTATED VERSION. Only comments starting with "// [ANN]" (or "// [PAPER]") were added;
+// every original code line is unchanged. Source: raw Dedaub decompilation of the Tessera
+// WETH/USDC pool on Base (impl 0x6d9...41CB, "spread" version, activated 12 Aug 2026).
+// Paper: "Active Liquidity On Chain: Evidence from PropAMMs Across Chains" (arXiv 2609.38056).
+//
+// [ANN] ONE-PARAGRAPH MAP
+//   Quote state   : stor_0 = {tag byte, ref block (u40 @208), anchor p (u128 @80), spread s (u24 @56)}
+//   Ladders       : slots 8..27 (base side) and 28..47 (quote side); each = {amount u160, multiplier u64, end-flag u8 @224}
+//   Flow netting  : _poolState (slot 3) and stor_4 (slot 4) = running totals per direction
+//   Fees (paper's six components): base, age, priority, mode, default, address
+//   Helpers       : _poolManager (slot 2), stor_33 (fingerprint helper), stor_34 (mode-fee helper)
+//   Swap output   : walk ladder -> output; then output *= (1 - total_fee)   (fee applied AFTER traversal)
+// =====================================================================================
+contract Decompiled {
+    // Decompiled by library.dedaub.com
+// 2026.09.19 22:32 UTC
+// Compiled using the solidity compiler version 0.8.33
+
+
+    // Data structures and variables inferred from the use of storage instructions
+    // [ANN] stor_0: packed quote state. Decoded in 0x39c1 / 0x21523c7e:
+    //       uint8 tag = byte(stor_0,0) (top byte), uint40 refBlock = stor_0>>208,
+    //       uint128 anchor = stor_0>>80, uint24 spread(ppm) = stor_0>>56. Written by the (undecompiled) update path.
+    //       [PAPER] "single anchor price p and a single spread s"; "each price update records a reference block".
+    uint256 stor_0; // STORAGE[0x0]
+    // [ANN] Despite the name, this is the running total for ONE direction (flow accumulator A). Reset by 0xdba310cf / 0x209dab1e.
+    //       [PAPER] "two running totals, one per asset, of the amounts traded in each direction".
+    uint256 _poolState; // STORAGE[0x3]
+    // [ANN] Flow accumulator B (opposite direction). See _poolState.
+    uint256 stor_4; // STORAGE[0x4]
+    // [ANN] Packed: low 160 bits = operator address (the price/book updater). Bits 160..191 = DEFAULT FEE (ppm, uint32),
+    //       set by 0x1667d875. [PAPER] "default" fee component; flipped early/late in block ("spoofing").
+    uint256 _disableTrading; // STORAGE[0x32]
+    // [ANN] Kill switch, toggled by operator or poolManager (enableTrading/disableTrading).
+    bool _tradingEnabled; // STORAGE[0x1] bytes 0 to 0
+    bool _isInitialised; // STORAGE[0x1] bytes 1 to 1
+    // [ANN] stor_5_0_3 = BASE fee (ppm). [PAPER] "base" component. Used inside 0x15bb/0x2aa6/0x34e5/0x3786 (v1 = stor_5_0_3).
+    uint32 stor_5_0_3; // STORAGE[0x5] bytes 0 to 3
+    // [ANN] stor_5_4_7 = factor (ppm) applied to the swap OUTPUT before adding to the flow accumulators
+    //       (accumulator += output * stor_5_4_7 / 1e6). Controls how much of a trade is "netted" against the opposite direction.
+    uint32 stor_5_4_7; // STORAGE[0x5] bytes 4 to 7
+    // [ANN] stor_5_8_8 = number of best levels (closest to anchor) to EXCLUDE; only active while block.number < poolManager.0x8c4cdb49().
+    //       [PAPER] "exclude a configurable number of levels closest to the anchor price".
+    uint8 stor_5_8_8; // STORAGE[0x5] bytes 8 to 8
+    // [ANN] stor_5_9_9 = netting enabled flag (if true, opposite-direction flow replenishes the levels).
+    bool stor_5_9_9; // STORAGE[0x5] bytes 9 to 9
+    // [ANN] Slot 6 = AGE-fee parameters, used by 0x25cc() -> struct and 0x4494():
+    //       6_0_7 = expiry age (blocks) after which NO FILL (returns uint32.max); 6_8_15 = grace period (blocks);
+    //       6_16_19 = quadratic coefficient; 6_20_23 = age-fee cap (ppm). [PAPER] "quote freshness".
+    uint64 stor_6_0_7; // STORAGE[0x6] bytes 0 to 7
+    // [ANN] Slot 7 = ADDRESS-fee (7_0_3, ppm), whitelist-only mode (7_4_4), PRIORITY-fee params (7_5_8 multiplier, 7_9_12 fee).
+    uint32 stor_7_0_3; // STORAGE[0x7] bytes 0 to 3
+    bool stor_7_4_4; // STORAGE[0x7] bytes 4 to 4
+    uint32 stor_7_5_8; // STORAGE[0x7] bytes 5 to 8
+    address _multiSigOwner; // STORAGE[0x1] bytes 2 to 21
+    // [ANN] Manager/registry: isActive() kill switch, address labels (0x8547d972), exclusion-block (0x8c4cdb49),
+    //       and the only authorised caller of 0x209dab1e. Shared across pools.
+    address _poolManager; // STORAGE[0x2] bytes 0 to 19
+    uint64 stor_6_8_15; // STORAGE[0x6] bytes 8 to 15
+    uint32 stor_7_9_12; // STORAGE[0x7] bytes 9 to 12
+    address _baseToken; // STORAGE[0x30] bytes 0 to 19
+    address _quoteToken; // STORAGE[0x31] bytes 0 to 19
+    // [ANN] stor_33 = ADDRESS FINGERPRINT HELPER: staticcall 0x1ed58fc8(tx.origin, caller) -> bool. [PAPER] helper "0xfdb...684"
+    //       (prefix / bytecode pattern matching, e.g. coffee prefix, forwarding contracts). Fetch its code: highest-value target.
+    address stor_33_0_19; // STORAGE[0x33] bytes 0 to 19
+    // [ANN] stor_34 = MODE-FEE HELPER: staticcall 0x4a89bec0(uint8 mode) -> ppm fee. [PAPER] "mode" component.
+    address stor_34_0_19; // STORAGE[0x34] bytes 0 to 19
+    uint32 stor_6_16_19; // STORAGE[0x6] bytes 16 to 19
+    uint32 stor_6_20_23; // STORAGE[0x6] bytes 20 to 23
+    // [ANN] Token decimals (base, quote), used for decimal conversion in 0x3aff / 0x3b89.
+    uint8 stor_31_20_20; // STORAGE[0x31] bytes 20 to 20
+    uint8 stor_31_21_21; // STORAGE[0x31] bytes 21 to 21
+    // [ANN] OpenZeppelin ReentrancyGuard slot (see 0x409c: 1 -> 2 on entry; swap sets it back to 1 at the end).
+    uint256 stor_9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00; // STORAGE[0x9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00]
+
+
+
+    function 0x5b7e30e5() public nonPayable {
+        require(msg.data.length - 4 >= 0);
+        // [ANN] getter: base token decimals
+        return stor_31_20_20;
+    }
+
+    // [ANN] EXACT-INPUT SWAP. (side, amountIn, recipient/caller-ish, bytes data). side: 0 = sell base? / 1 = opposite.
+    //       First byte of `data` (msg.data[v1] >> 248) is the MODE byte -> mode fee via stor_34 helper.
+    //       Flow: trading-enabled + poolManager.isActive() checks -> reentrancy lock -> read quote (0x39c1) ->
+    //       walk ladder (0x329b) -> fee (0x3786 + mode 0x4120) -> output *= (1 - fee) -> update flow accumulators -> emit.
+    //       NOTE: no token transfers here; function returns a signed delta (negated output via 0x3050 on one side),
+    //       settlement is presumably done by the caller (poolManager/router).
+    function 0x4c7c47b7(uint256 varg0, uint256 varg1, address varg2, uint256 varg3) public nonPayable {
+        require(msg.data.length - 4 >= 128);
+        require(varg0 < 2);
+        require(varg3 <= uint64.max);
+        require(varg3 + 35 < msg.data.length);
+        v0 = varg3.length;
+        require(v0 <= uint64.max);
+        require(varg3 + v0 + 36 <= msg.data.length);
+        v1 = varg3.data;
+        v2 = 0x2a25();
+        // [ANN] trading switch (revert string 0x2a25 = "T11"-style code, see constants 0x5431xx)
+        if (!_tradingEnabled) {
+            v3 = new bytes[](v2.length);
+            MCOPY(v3.data, v2.data, v2.length);
+            v3[v2.length] = 0;
+            revert(Error(v3));
+        } else {
+            v1 = v4 = _poolManager;
+            // [ANN] [PAPER] manager-level kill switch / authorisation: poolManager.isActive()
+            v5, v6 = v4.isActive().gas(msg.gas);
+            require(v5, MEM[64], RETURNDATASIZE());
+            v0 = v7 = 0x519c4;
+            v0 = v8 = 4479;
+            v1 = v9 = 4511;
+            v6 = v10 = 0;
+            if (v5) {
+                v11 = v12 = 32;
+                if (32 > RETURNDATASIZE()) {
+                    v11 = v13 = RETURNDATASIZE();
+                }
+                require(!((MEM[64] + (v11 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (MEM[64] + (v11 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+                MEM[64] = MEM[64] + (v11 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0);
+                require(MEM[64] + v11 - MEM[64] >= 32);
+                require(!0x22f3e2d3ffffffffffffffffffffffffffffffffffffffffffffffffffffffff);
+            }
+            v14 = v15 = 0x284a();
+            while (v6) {
+                // Unknown jump to Block ['0x117f', '0x519c4']. Refer to 3-address code (TAC);
+                v14 = v16 = 0x2885();
+                v6 = v17 = msg.sender == v1;
+            }
+            // [ANN] Dedaub lost the control flow here: the revert below is the "caller != poolManager / !isActive" branch.
+            //       Everything after revert() is the real continuation that Dedaub stitched in as dead code.
+            v18 = new uint256[](MEM[v14]);
+            MCOPY(v18.data, v14 + 32, MEM[v14]);
+            MEM[MEM[64] + MEM[v14] + 68] = 0;
+            revert(Error(v18));
+            // [ANN] reentrancy lock acquire (OZ ReentrancyGuard)
+            0x409c();
+            v19 = 0x2f64();
+            if (bool(!v0)) {
+                v20 = new bytes[](v19.length);
+                MCOPY(v20.data, v19.data, v19.length);
+                v20[v19.length] = 0;
+                revert(Error(v20));
+            } else {
+                if (!v0) {
+                    v21 = v22 = 0;
+                } else {
+                    // [ANN] MODE byte = first byte of user-supplied `data`. [PAPER] "mode" fee component.
+                    v21 = v23 = msg.data[v1] >> 248;
+                    // Unknown jump to Block 0x119f. Refer to 3-address code (TAC);
+                }
+                // [ANN] 0x39c1(side): derive top-of-book price from stor_0 anchor/spread. Returns (ok, price, anchor, refBlock, tag).
+                v24, v25, v26, v27, v28 = 0x39c1(v1);
+                v29 = 0x2f9f();
+                if (!v24) {
+                    v30 = new bytes[](v29.length);
+                    MCOPY(v30.data, v29.data, v29.length);
+                    v30[v29.length] = 0;
+                    revert(Error(v30));
+                } else {
+                    // [ANN] 0x329b = ladder walk (exact-in): amountIn -> gross output (BEFORE fees). [PAPER] Y_book(x)
+                    v31 = v32 = 0x329b(v1, v0);
+                    v33 = 0x3015();
+                    // [ANN] revert "T8: Insufficient Liquidity" if the ladder cannot fill (0x3015)
+                    if (bool(!v32)) {
+                        v34 = new bytes[](v33.length);
+                        MCOPY(v34.data, v33.data, v33.length);
+                        v34[v33.length] = 0;
+                        revert(Error(v34));
+                    } else {
+                        // [ANN] 0x4120(mode) = MODE fee from helper stor_34.
+                        v35 = 0x4120(v21);
+                        // [ANN] 0x3786 = total-fee calculator (age + base + address + priority + default); returns (rejected, feePpm).
+                        v36, v37 = 0x3786(v0, v27, v35);
+                        v38 = 0x2fda();
+                        if (bool(v36)) {
+                            v39 = new bytes[](v38.length);
+                            MCOPY(v39.data, v38.data, v38.length);
+                            v39[v38.length] = 0;
+                            revert(Error(v39));
+                        } else {
+                            if (uint32(v37)) {
+                                // [ANN] output = gross * (1e6 - fee) / 1e6. [PAPER] Y_exec = Y_book * (1 - phi): fee applied AFTER traversal.
+                                v40 = 0x2c2c(uint32(v37));
+                                v41 = _SafeMul(v32, v40);
+                                v31 = v42 = v41 / 10 ** 6;
+                            }
+                            require(!0, Panic(65)); // failed memory allocation (too much memory)
+                            if (bool(!v31)) {
+                                v43 = new bytes[](v44.length);
+                                MCOPY(v43.data, v44.data, v43.length);
+                                v43[v44.length] = 0;
+                                revert(Error(v43));
+                            } else {
+                                require(v1 < 2, Panic(33)); // failed convertion to enum type
+                                // [ANN] sign convention: negate (0x3050) the amount on one side -> signed deltas for the settlement layer
+                                if (0 == (v1 == 1)) {
+                                    v0 = v45 = 0x3050(v31);
+                                }
+                                if (bool(v1)) {
+                                    v0 = v46 = 0x3050(v31);
+                                }
+                                // [ANN] Swap event (topic 0x5644...326e): amounts, tokens, tag, both accumulators
+                                emit 0x56441808e0dc590c63862fb3c0c914bff286fc67b3983cd294eb33e21cca326e(address(v0), v0, v0, _baseToken, _quoteToken, uint8(v28), stor_4, _poolState);
+                                require((v0 * stor_5_4_7 / v0 == stor_5_4_7) | !v0, Panic(17)); // arithmetic overflow or underflow
+                                // [ANN] FLOW ACCUMULATION: add (output * netting factor) to the accumulator of the traded direction.
+                                //       [PAPER] "Trading in one direction can deplete the levels closest to the anchor or replenish the opposite ones."
+                                if (bool(v1)) {
+                                    v47 = _SafeAdd(stor_4, v0 * stor_5_4_7 / 10 ** 6);
+                                    stor_4 = v47;
+                                } else {
+                                    v48 = _SafeAdd(_poolState, v0 * stor_5_4_7 / 10 ** 6);
+                                    _poolState = v48;
+                                }
+                                // [ANN] 0x41e3 = pure gas-burner: 1000 iterations of memory allocation, no effect. Pads swap gas
+                                //       (paper: swap 201k-402k gas vs ~27k for an update).
+                                0x41e3();
+                                if (uint8(v21)) {
+                                    // [ANN] event emitted only if mode byte != 0 (topic 0x61e1...f23b)
+                                    emit 0x61e15d162454aea85616c856a9216347d7d7e4015784dd40eec674c403f3f23b(uint8(v21));
+                                }
+                                // [ANN] reentrancy lock release (back to 1)
+                                stor_9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00 = 1;
+                                return v31;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    function tradingEnabled() public nonPayable {
+        require(msg.data.length - 4 >= 0);
+        return _tradingEnabled;
+    }
+
+    // [ANN] EXACT-OUTPUT SWAP (same arguments as 0x4c7c47b7). Walks the ladder backwards: given a desired output it computes the
+    //       input needed (ceil division, "+ x - 1 / x"). Structure is otherwise identical: same checks, same fee path (0x15bb is
+    //       the inlined/explicit version of 0x3786), same accumulator update at the end.
+    function 0x4a036fcb(uint256 varg0, uint256 varg1, address varg2, uint256 varg3) public nonPayable {
+        require(msg.data.length - 4 >= 128);
+        require(varg0 < 2);
+        require(varg3 <= uint64.max);
+        require(varg3 + 35 < msg.data.length);
+        v0 = varg3.length;
+        require(v0 <= uint64.max);
+        require(varg3 + v0 + 36 <= msg.data.length);
+        v1 = varg3.data;
+        v2 = 0x2a25();
+        if (!_tradingEnabled) {
+            v3 = new bytes[](v2.length);
+            MCOPY(v3.data, v2.data, v2.length);
+            v3[v2.length] = 0;
+            revert(Error(v3));
+        } else {
+            v1 = v4 = _poolManager;
+            v5, v6 = v4.isActive().gas(msg.gas);
+            require(v5, MEM[64], RETURNDATASIZE());
+            v0 = v7 = 0x51b17;
+            v0 = v8 = 5391;
+            v1 = v9 = 5418;
+            v6 = v10 = 0;
+            if (v5) {
+                v11 = v12 = 32;
+                if (32 > RETURNDATASIZE()) {
+                    v11 = v13 = RETURNDATASIZE();
+                }
+                require(!((MEM[64] + (v11 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (MEM[64] + (v11 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+                MEM[64] = MEM[64] + (v11 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0);
+                require(MEM[64] + v11 - MEM[64] >= 32);
+                require(!0x22f3e2d3ffffffffffffffffffffffffffffffffffffffffffffffffffffffff);
+                v14 = v15 = 0x284a();
+            } else {
+                v14 = v16 = 0x284a();
+            }
+            while (v6) {
+                // Unknown jump to Block ['0x150f', '0x51b17']. Refer to 3-address code (TAC);
+                v14 = v17 = 0x2885();
+                v6 = v18 = msg.sender == v1;
+            }
+            v19 = new uint256[](MEM[v14]);
+            MCOPY(v19.data, v14 + 32, MEM[v14]);
+            MEM[MEM[64] + MEM[v14] + 68] = 0;
+            revert(Error(v19));
+            0x409c();
+            v20 = 0x2f64();
+            if (bool(!v0)) {
+                v21 = new bytes[](v20.length);
+                MCOPY(v21.data, v20.data, v20.length);
+                v21[v20.length] = 0;
+                revert(Error(v21));
+            } else {
+                if (!v0) {
+                    v22 = v23 = 0;
+                } else {
+                    // [ANN] MODE byte from user data (see 0x4c7c47b7)
+                    v22 = v24 = msg.data[v1] >> 248;
+                    // Unknown jump to Block 0x152a. Refer to 3-address code (TAC);
+                }
+                v25, v26, v27, v28, v29 = 0x39c1(v1);
+                v30 = 0x2f9f();
+                if (!v25) {
+                    v31 = new bytes[](v30.length);
+                    MCOPY(v31.data, v30.data, v30.length);
+                    v31[v30.length] = 0;
+                    revert(Error(v31));
+                } else {
+                    // [ANN] 0x2b33 = empty Order[20] memory array (zero-initialised); filled below from storage
+                    v32 = 0x2b33();
+                    require(v1 < 2, Panic(33)); // failed convertion to enum type
+                    if (bool(v1)) {
+                        // [ANN] 0x3aff / 0x3bcc / 0x3b89: decimal conversions and price inversion (1e36 / price).
+                        //       Side 1 uses the inverted price, so both sides can share one ladder-walk routine.
+                        v33 = 0x3aff(v26);
+                        v34 = 0x3bcc(v27);
+                        v35 = 0x2b7a();
+                        if (uint128(v34) == uint128.max) {
+                            v36 = new bytes[](v35.length);
+                            MCOPY(v36.data, v35.data, v35.length);
+                            v36[v35.length] = 0;
+                            revert(Error(v36));
+                        } else {
+                            v37 = 0x3b89(v34);
+                            // [ANN] 0x2629 = load base-side ladder (slots 8..27). [PAPER] ask ladder
+                            v38 = 0x2629();
+                            // [ANN] NETTING INPUTS: own-direction total (v39) and opposite-direction total (v40)
+                            v39 = stor_4;
+                            v40 = _poolState;
+                            // [ANN] 0x15bb = fee computation (same logic as 0x3786 / 0x2aa6 / 0x34e5, dedaub emitted four copies)
+                            v41, v42 = v43, v44 = v45, v46, v47 = v48, v49 = v50, v51 = v52, v53 = v54, v55 = v56, v57 = v58, v59 = v60, v61 = v62 = 0x15bb(v28, 0x51cae, v39, 5590, v33, v38, v40, v0, v0, v37, !v1);
+                            v63 = 0x2fda();
+                            if (bool(v41)) {
+                                v64 = new bytes[](v63.length);
+                                MCOPY(v64.data, v63.data, v63.length);
+                                v64[v63.length] = 0;
+                                revert(Error(v64));
+                            } else {
+                                // Unknown jump to Block 0x15d6. Refer to 3-address code (TAC);
+                            }
+                        }
+                    } else {
+                        v65 = 0x3bcc(v26);
+                        v66 = 0x2b7a();
+                        if (uint128(v65) == uint128.max) {
+                            v67 = new bytes[](v66.length);
+                            MCOPY(v67.data, v66.data, v66.length);
+                            v67[v66.length] = 0;
+                            revert(Error(v67));
+                        } else {
+                            v68 = 0x3b89(v65);
+                            v69 = 0x3aff(v27);
+                            // [ANN] 0x26a2 = load quote-side ladder (slots 28..47). [PAPER] bid ladder
+                            v70 = 0x26a2();
+                            v71 = _poolState;
+                            v72 = stor_4;
+                            v73, v42 = v74, v44 = v75, v76, v47 = v77, v49 = v78, v51 = v79, v53 = v80, v55 = v81, v57 = v82, v59 = v83, v61 = v84 = 0x15bb(v28, 0x51c34, v71, 5590, v68, v70, v72, v0, v0, v69, !v1);
+                            v85 = 0x2fda();
+                            if (bool(v73)) {
+                                v86 = new bytes[](v85.length);
+                                MCOPY(v86.data, v85.data, v85.length);
+                                v86[v85.length] = 0;
+                                revert(Error(v86));
+                            }
+                        }
+                    }
+                    if (uint32(v42)) {
+                        // [ANN] exact-out: gross-up the required input by 1/(1-fee) (0x3c41, ceil). Overflow guard returns uint256.max.
+                        v53 = v87 = 0x3c41(v53, v42);
+                        require(!0, Panic(65)); // failed memory allocation (too much memory)
+                        if (v87 == uint256.max) {
+                            v88 = new bytes[](v89.length);
+                            MCOPY(v88.data, v89.data, v88.length);
+                            v88[v89.length] = 0;
+                            revert(Error(v88));
+                        }
+                    }
+                    // [ANN] FLOW NETTING (stor_5_9_9): subtract the opposite accumulator, converted at price (x * price / 1e18), from
+                    //       the own-direction accumulator => net depleted amount. [PAPER] "The two directions are netted at the current anchor price p."
+                    if (stor_5_9_9) {
+                        v90 = _SafeMul(v51, uint128(v57));
+                        if (v44 <= v90 / 10 ** 18) {
+                            v44 = v91 = 0;
+                        } else {
+                            v44 = v92 = _SafeSub(v44, v90 / 10 ** 18);
+                        }
+                    }
+                    // [ANN] poolManager.0x8c4cdb49() -> block number until which the best N levels are excluded
+                    v93, v94 = _poolManager.staticcall(0x8c4cdb4900000000000000000000000000000000000000000000000000000000).gas(msg.gas);
+                    require(v93, MEM[64], RETURNDATASIZE());
+                    v94 = v95 = 0;
+                    if (v93) {
+                        v96 = v97 = 32;
+                        if (32 > RETURNDATASIZE()) {
+                            v96 = v98 = RETURNDATASIZE();
+                        }
+                        require(!((MEM[64] + (v96 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (MEM[64] + (v96 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+                        require(MEM[64] + v96 - MEM[64] >= 32);
+                    }
+                    // [ANN] level exclusion active only while block.number < exclusion block. [PAPER] "exclude a configurable number of levels"
+                    if (0 == block.number < v94) {
+                        v99 = v100 = 0;
+                    } else {
+                        v99 = v101 = stor_5_8_8;
+                    }
+                    v102 = v103 = 0;
+                    v44 = v104 = 0;
+                    v105 = v106 = 20;
+                    v107 = v108 = 0;
+                    // [ANN] LADDER WALK (exact-out variant). Phase 1 (v107 loop): skip the first `excluded` levels; each must be a live level.
+                    //       Phase 2: consume already-used liquidity (accumulator v44) from the top levels (netting/depletion).
+                    //       Phase 3: for each remaining level: price multiplier (MEM[..+32], u64) must be STRICTLY DECREASING
+                    //       (else revert 0x3d3c); level price = anchorPrice * multiplier / 1e6; level capacity = amount (address-typed slot, 160 bits).
+                    //       [PAPER] "each level a fixed multiplier that places it relative to [anchor and spread]".
+                    while (1) {
+                        v109 = v110 = v107 < uint8(v99);
+                        if (v110) {
+                            v109 = v111 = v107 < v106;
+                        }
+                        if (!v109) {
+                            v105 = v112 = uint8(v99);
+                            // [ANN] Phase 2: eat `v44` (already-accessed volume) from the best accessible levels first
+                            while (v105 < 20) {
+                                v113 = 0x3d2b(v49, v105);
+                                // [ANN] MEM[MEM[x]+64] = end-of-book flag (word2)
+                                if (MEM[MEM[v113] + 64]) {
+                                    break;
+                                } else {
+                                    v114 = 0x3d2b(v49, v105);
+                                    // [ANN] address(MEM[MEM[x]]) = level amount (160-bit field)
+                                    if (v44 >= address(MEM[MEM[v114]])) {
+                                        v115 = 0x3d2b(v49, v105);
+                                        v44 = _SafeSub(v44, address(MEM[MEM[v115]]));
+                                        v105 = v105 + 1;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                            if (v105 == 20) {
+                                v102 = v116 = uint256.max;
+                                break;
+                            } else {
+                                v117 = v118 = uint64.max;
+                                // [ANN] Phase 3: walk the remaining levels
+                                while (v105 < 20) {
+                                    v119 = 0x3d2b(v49, v105);
+                                    if (MEM[MEM[v119] + 64]) {
+                                        break;
+                                    } else {
+                                        v120 = 0x3d2b(v49, v105);
+                                        v121 = 0x3d3c();
+                                        // [ANN] strictly-decreasing multiplier check (revert T-code 0x3d3c)
+                                        if (uint64(v117) <= uint64(MEM[MEM[v120] + 32])) {
+                                            v122 = new bytes[](v121.length);
+                                            MCOPY(v122.data, v121.data, v121.length);
+                                            v122[v121.length] = 0;
+                                            revert(Error(v122));
+                                        } else {
+                                            v123 = 0x3d2b(v49, v105);
+                                            v117 = v124 = uint64(MEM[MEM[v123] + 32]);
+                                            v125 = 0x3d2b(v49, v105);
+                                            // [ANN] level price = anchor(v47) * multiplier / 1e6 (v126 / 1e6)
+                                            v126 = _SafeMul(uint128(v47), uint64(MEM[MEM[v125] + 32]));
+                                            if (v105 - v105) {
+                                                v127 = 0x3d2b(v49, v105);
+                                                v128 = v129 = address(MEM[MEM[v127]]);
+                                            } else {
+                                                // [ANN] first level already partially consumed by Phase 2 remainder
+                                                v130 = 0x3d2b(v49, v105);
+                                                v128 = v131 = _SafeSub(address(MEM[MEM[v130]]), v44);
+                                            }
+                                            v132 = _SafeMul(v128, v126 / 10 ** 6);
+                                            if (v53 < v132 / 10 ** 18) {
+                                                // [ANN] last (partially filled) level: needed input = ceil(remainingOut*1e18 / price)
+                                                require(!v53 | (10 ** 18 == v53 * 10 ** 18 / v53), Panic(17)); // arithmetic overflow or underflow
+                                                v133 = _SafeAdd(v53 * 10 ** 18, v126 / 10 ** 6);
+                                                require(v133 - 1 <= v133, Panic(17)); // arithmetic overflow or underflow
+                                                v134 = _SafeDiv(v133 - 1, v126 / 10 ** 6);
+                                                v102 = v135 = _SafeAdd(v102, v134);
+                                                v53 = v136 = 0;
+                                                break;
+                                            } else {
+                                                // [ANN] consume the whole level, continue
+                                                v102 = _SafeAdd(v102, v128);
+                                                v53 = _SafeSub(v53, v132 / 10 ** 18);
+                                                v105 = v105 + 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (v53) {
+                                    // [ANN] not enough liquidity -> uint256.max sentinel => "T8: Insufficient Liquidity"
+                                    v102 = v137 = uint256.max;
+                                    break;
+                                } else {
+                                    break;
+                                }
+                            }
+                        } else {
+                            v138 = 0x3d2b(v49, v107);
+                            if (MEM[MEM[v138] + 64]) {
+                                v102 = v139 = uint256.max;
+                                break;
+                            } else {
+                                v107 = 0x3cfe(v107);
+                            }
+                        }
+                    }
+                    v140 = 0x3015();
+                    if (v102 == uint256.max) {
+                        v141 = new bytes[](v140.length);
+                        MCOPY(v141.data, v140.data, v141.length);
+                        v141[v140.length] = 0;
+                        revert(Error(v141));
+                    } else {
+                        require(!0, Panic(65)); // failed memory allocation (too much memory)
+                        if (bool(!v102)) {
+                            v142 = new bytes[](v143.length);
+                            MCOPY(v142.data, v143.data, v142.length);
+                            v142[v143.length] = 0;
+                            revert(Error(v142));
+                        } else {
+                            if (v1 - 1) {
+                                v102 = v144 = 0x3050(v53);
+                            }
+                            if (!v59) {
+                                v102 = v145 = 0x3050(v53);
+                            }
+                            emit 0x56441808e0dc590c63862fb3c0c914bff286fc67b3983cd294eb33e21cca326e(address(v55), v102, v102, _baseToken, _quoteToken, uint8(v29), stor_4, _poolState);
+                            require((v102 * stor_5_4_7 / v102 == stor_5_4_7) | !v102, Panic(17)); // arithmetic overflow or underflow
+                            // [ANN] accumulator update, same as exact-in
+                            if (!v59) {
+                                v146 = _SafeAdd(stor_4, v102 * stor_5_4_7 / 10 ** 6);
+                                stor_4 = v146;
+                            } else {
+                                v147 = _SafeAdd(_poolState, v102 * stor_5_4_7 / 10 ** 6);
+                                _poolState = v147;
+                            }
+                            // [ANN] gas burner (1000 iterations), see 0x41e3
+                            0x41e3();
+                            if (uint8(v61)) {
+                                emit 0x61e15d162454aea85616c856a9216347d7d7e4015784dd40eec674c403f3f23b(uint8(v61));
+                            }
+                            stor_9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00 = 1;
+                            return v102;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    function 0xece42d7f() public nonPayable {
+        require(msg.data.length - 4 >= 0);
+        // [ANN] getter: quote token decimals
+        return stor_31_21_21;
+    }
+
+    // [ANN] 0x15bb: FEE CALCULATOR (explicit copy used by exact-out). Same logic as 0x2aa6, 0x34e5, 0x3786 (Dedaub emitted 4 copies;
+    //       treat them as one function). Returns (rejected, feePpm, ...passthrough args).
+    //       Components (paper's six): [age] 0x4494 -> [base] stor_5_0_3 -> [address] poolManager.0x8547d972 for caller AND tx.origin
+    //       (+ fingerprint helper 0x481b) -> [priority] staticcall 0xeb101276 vs tx.gasprice-basefee -> [default] _disableTrading>>160;
+    //       [mode] is added by the caller (0x4120). Garbled control flow: the while(1) with "Unknown jump" is the fee-summation tail.
+    function 0x15bb(uint256 varg0, uint256 varg1, uint256 varg2, uint256 varg3, uint256 varg4, struct(20) varg5, uint256 varg6, uint256 varg7, uint256 varg8, uint256 varg9, uint256 varg10) private {
+        varg10 = v0 = 0x4120(v1);
+        // [ANN] 0x25cc loads the AGE-fee parameter struct from slot 6 {expiry, grace, coef, cap}
+        v2 = 0x25cc();
+        // [ANN] AGE fee: 0x4494(params, refBlock (from stor_0>>208, passed in as varg0), block.number).
+        //       returns uint32.max => quote EXPIRED => NO FILL; 0 within grace; else min(cap, coef*(age-grace+1)^2).
+        //       [PAPER] "no freshness penalty for a short grace period, an increasingly worse price thereafter, and no fill at all once the quote expires."
+        varg10 = v3 = 0x4494(v2, varg0, uint64(block.number));
+        if (uint32(v3) == uint32.max) {
+            // [ANN] expired: returns rejected=1
+            return 1, 0, varg2, varg3, varg4, varg5, varg6, varg7, varg8, varg9, varg10, v1;
+        } else {
+            // [ANN] BASE fee (stor_5_0_3)
+            varg10 = v4 = stor_5_0_3;
+            varg10 = v5 = _poolManager;
+            v6 = v7 = MEM[64];
+            // [ANN] ADDRESS LABEL of msg.sender/caller (varg8): poolManager.0x8547d972(addr) -> enum {0 ordinary,1 exempt,2 penalized,3 blacklisted}
+            v8 = v5.staticcall(0x8547d97200000000000000000000000000000000000000000000000000000000, address(varg8)).gas(msg.gas);
+            require(v8, MEM[64], RETURNDATASIZE());
+            varg10 = v9 = 0;
+            if (v8) {
+                v10 = v11 = 14768;
+                if (32 <= RETURNDATASIZE()) {
+                    require(!((v7 + 32 > uint64.max) | (v7 + 32 < v7)), Panic(65)); // failed memory allocation (too much memory)
+                    MEM[64] = v7 + 32;
+                    v12 = v13 = v7 + 32;
+                }
+            }
+            v6 = v14 = MEM[64];
+            // [ANN] same label lookup for tx.origin. [PAPER] "checks the transaction origin and the public-interface caller."
+            v15 = varg10.staticcall(0x8547d97200000000000000000000000000000000000000000000000000000000, tx.origin).gas(msg.gas);
+            if (!v15) {
+                RETURNDATACOPY(MEM[64], 0, RETURNDATASIZE());
+                revert(MEM[64], RETURNDATASIZE());
+            } else {
+                varg10 = v16 = 0;
+                if (v15) {
+                    varg10 = v17 = uint16.max;
+                    v10 = v18 = 14735;
+                    if (32 <= RETURNDATASIZE()) {
+                        require(!((v14 + 32 > uint64.max) | (v14 + 32 < v14)), Panic(65)); // failed memory allocation (too much memory)
+                        MEM[64] = v14 + 32;
+                        v12 = v19 = v14 + 32;
+                    }
+                }
+            }
+            v20 = uint16(varg10);
+            require(v20 < 4, Panic(33)); // failed convertion to enum type
+            require(uint16(varg10) < 4, Panic(33)); // failed convertion to enum type
+            varg10 = v21 = 0x522da;
+            varg10 = v22 = 32;
+            varg10 = v23 = 0x522ff;
+            varg10 = v24 = 0x52323;
+            varg10 = v25 = 4;
+            varg10 = v26 = 14520;
+            // [ANN] label == 1 (default-exempt) for either caller or origin => DEFAULT fee is waived (set to 0)
+            //       [PAPER] "exemption waives the default penalty".
+            if (v20 != 1) {
+                if (uint16(varg10) == 1) {
+                    varg10 = v27 = 0;
+                }
+            } else if (v20 == 1) {
+                varg10 = v28 = 0;
+            }
+            // [ANN] DEFAULT fee = _disableTrading >> 160 (uint32 ppm). Operator-controlled, flipped within the block via 0x1667d875.
+            varg10 = v29 = uint32(_disableTrading >> 160);
+            while (1) {
+                // [ANN] fee summation (components added with overflow check)
+                varg10 = uint32(varg10) + uint32(varg10);
+                require(varg10 <= uint32.max, Panic(17)); // arithmetic overflow or underflow
+                // Unknown jump to Block ['0x36ad0x15bb', '0x38b80x15bb', '0x522da0x15bb', '0x522ff0x15bb', '0x523480x15bb']. Refer to 3-address code (TAC);
+                // [ANN] PRIORITY fee reference: staticcall to varg10 (target garbled by Dedaub; likely poolManager) selector 0xeb101276 -> value R.
+                v30 = varg10.staticcall(0xeb10127600000000000000000000000000000000000000000000000000000000).gas(msg.gas);
+                if (!v30) {
+                    RETURNDATACOPY(MEM[64], 0, RETURNDATASIZE());
+                    revert(MEM[64], RETURNDATASIZE());
+                } else {
+                    v31 = v32 = 0;
+                    if (v30) {
+                        v33 = v34 = 32;
+                        if (32 > RETURNDATASIZE()) {
+                            v33 = v35 = RETURNDATASIZE();
+                        }
+                        require(!((MEM[64] + (v33 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (MEM[64] + (v33 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+                        require(MEM[64] + v33 - MEM[64] >= 32);
+                    }
+                    varg10 = v36 = 13997;
+                    varg10 = v37 = 0x52348;
+                    // [ANN] PRIORITY: if (tx.gasprice - basefee) > R * stor_7_5_8 / 1e6 then charge stor_7_9_12 else 0.
+                    //       [PAPER] "Tessera charges an additional penalty on trades paying a high priority fee" (spikes at 2 and 5 bps).
+                    v38 = _SafeMul(v31, stor_7_5_8);
+                    v39 = 0x48d5();
+                    if (v39 <= v38 / 10 ** 6) {
+                        varg10 = v40 = 0;
+                    } else {
+                        varg10 = v41 = stor_7_9_12;
+                    }
+                }
+            }
+            // [ANN] cap total fee at 1e6 ppm (100%)
+            if (uint32(varg10) > 10 ** 6) {
+                return 0, 10 ** 6, varg10, varg10, varg10, varg10, varg10, varg10, varg10, varg10, varg10, varg10;
+            } else {
+                return 0, varg10, varg10, varg10, varg10, varg10, varg10, varg10, varg10, varg10, varg10, varg10;
+            }
+            // [ANN] ---- everything below the returns is the other half of the real function that Dedaub placed after the return
+            //       (the address-classification block). Same logic as the copies in 0x2aa6/0x34e5/0x3786. ----
+            varg10 = v42 = _poolManager;
+            v6 = v43 = MEM[64];
+            v44 = address(varg10);
+            v45 = v42.staticcall(0x8547d97200000000000000000000000000000000000000000000000000000000, v44).gas(msg.gas);
+            if (!v45) {
+                RETURNDATACOPY(MEM[64], 0, RETURNDATASIZE());
+                revert(MEM[64], RETURNDATASIZE());
+            } else {
+                varg10 = v46 = 36;
+                varg10 = v47 = 0;
+                if (v45) {
+                    varg10 = v48 = 32;
+                    v10 = v49 = 18452;
+                    if (v48 <= RETURNDATASIZE()) {
+                        require(!((v43 + 32 > uint64.max) | (v43 + 32 < v43)), Panic(65)); // failed memory allocation (too much memory)
+                        MEM[64] = v43 + 32;
+                        v12 = v50 = v43 + v48;
+                    }
+                }
+            }
+            require(!((v6 + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (v6 + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < v6)), Panic(65)); // failed memory allocation (too much memory)
+            MEM[64] = v6 + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0);
+            v12 = v51 = v6 + RETURNDATASIZE();
+            require(v12 - v6 >= 32);
+            varg10 = v52 = MEM[v6];
+            require(!(v52 - uint16(v52)));
+            // Unknown jump to Block ['0x398f0x15bb', '0x39b00x15bb', '0x47f20x15bb', '0x48140x15bb']. Refer to 3-address code (TAC);
+            // Unknown jump to Block 0x38700x15bb. Refer to 3-address code (TAC);
+            v53 = uint16(varg10);
+            require(v53 < 4, Panic(33)); // failed convertion to enum type
+            v54 = v55 = uint16(varg10) >= 4;
+            require(!v55, Panic(33)); // failed convertion to enum type
+            // [ANN] stor_7_4_4 = WHITELIST-ONLY MODE: if on, only label==1 addresses may trade (else AddressNotWhitelisted revert)
+            if (stor_7_4_4) {
+                require(!(v53 - 1), AddressNotWhitelisted());
+                varg10 = v56 = 0;
+            } else {
+                require(v53 < 4, Panic(33)); // failed convertion to enum type
+                v57 = v58 = v53 == 3;
+                if (v53 != 3) {
+                    v54 = v59 = 0;
+                    v57 = v60 = uint16(varg10) == 3;
+                }
+                // [ANN] label 3 (caller OR origin) => BLACKLISTED => revert. [PAPER] "blacklisting rejects execution"
+                require(!v57, AddressBlacklisted());
+                v61 = v62 = 2 == v53;
+                if (2 != v53) {
+                    require(!v54, Panic(33)); // failed convertion to enum type
+                    v63 = 2 == uint16(varg10);
+                    v61 = v63;
+                }
+                // [ANN] label 2 => PENALIZED => ADDRESS fee = stor_7_0_3.
+                //       The 500-iteration allocation loop is an extra gas tax on penalized callers (burns gas without effect).
+                if (v61) {
+                    v64 = v65 = 0;
+                    while (v64 < 500) {
+                        v66 = new struct(2);
+                        v67 = v66.data;
+                        v66.word1 = v64;
+                        v66.word0 = 32;
+                        require(!((v66 + 64 > uint64.max) | (v66 + 64 < v66)), Panic(65)); // failed memory allocation (too much memory)
+                        v64 = v64 + 1;
+                    }
+                    varg10 = v68 = stor_7_0_3;
+                    // Unknown jump to Block 0x523230x15bb. Refer to 3-address code (TAC);
+                } else {
+                    // [ANN] no explicit label: ask the FINGERPRINT HELPER (stor_33). True => ADDRESS fee. [PAPER] "bytecode fingerprint checks"
+                    v69 = 0x481b(varg10);
+                    if (v69) {
+                        varg10 = v70 = stor_7_0_3;
+                        // Unknown jump to Block 0x523230x15bb. Refer to 3-address code (TAC);
+                    } else {
+                        varg10 = v71 = 0;
+                        // Unknown jump to Block 0x523230x15bb. Refer to 3-address code (TAC);
+                    }
+                }
+            }
+            v6 = v72 = MEM[64];
+            v73 = varg10.staticcall(0x8547d97200000000000000000000000000000000000000000000000000000000, tx.origin).gas(msg.gas);
+            if (!v73) {
+                RETURNDATACOPY(MEM[64], 0, RETURNDATASIZE());
+                revert(MEM[64], RETURNDATASIZE());
+            } else {
+                varg10 = v74 = 0;
+                if (v73) {
+                    varg10 = v75 = uint16.max;
+                    v10 = v76 = 18418;
+                    if (32 <= RETURNDATASIZE()) {
+                        require(!((v72 + 32 > uint64.max) | (v72 + 32 < v72)), Panic(65)); // failed memory allocation (too much memory)
+                        MEM[64] = v72 + 32;
+                        v12 = v77 = v72 + 32;
+                    }
+                }
+            }
+        }
+    }
+
+    // [ANN] VIEW QUOTE (exact-out direction, same signature as 0x21523c7e): same ladder-walk as 0x4a036fcb but without state writes
+    //       and without the eth_call-visible fee path. Aggregators call this (against the end-of-previous-block state) to route.
+    //       [PAPER] "quotes vs execution": the quote the aggregator sees can differ from the fill because default fee / update / earlier swaps change.
+    function 0x43db5616(uint256 varg0, uint256 varg1, address varg2) public nonPayable {
+        require(msg.data.length - 4 >= 96);
+        require(varg0 < 2);
+        v0 = 0x2a25();
+        if (!_tradingEnabled) {
+            v1 = new bytes[](v0.length);
+            MCOPY(v1.data, v0.data, v0.length);
+            v1[v0.length] = 0;
+            revert(Error(v1));
+        } else {
+            v2 = v3 = _poolManager;
+            v4, v5 = v3.isActive().gas(msg.gas);
+            require(v4, MEM[64], RETURNDATASIZE());
+            v2 = v6 = 32;
+            v2 = v7 = 0x51cfd;
+            v2 = v8 = 6536;
+            v2 = v9 = 6541;
+            v5 = v10 = 0;
+            if (v4) {
+                if (v6 > RETURNDATASIZE()) {
+                    require(!((MEM[64] + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (MEM[64] + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+                    MEM[64] = MEM[64] + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0);
+                    v11 = v12 = MEM[64] + RETURNDATASIZE();
+                } else {
+                    require(!((MEM[64] + 32 > uint64.max) | (MEM[64] + 32 < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+                    MEM[64] = MEM[64] + 32;
+                    v11 = v13 = MEM[64] + v6;
+                }
+                require(v11 - MEM[64] >= 32);
+                require(!0x22f3e2d3ffffffffffffffffffffffffffffffffffffffffffffffffffffffff);
+                v14 = v15 = 0x284a();
+            } else {
+                v14 = v16 = 0x284a();
+            }
+            while (v5) {
+                // Unknown jump to Block ['0x1988', '0x51cfd']. Refer to 3-address code (TAC);
+                v14 = v17 = 0x2885();
+                v5 = v18 = msg.sender == v2;
+            }
+            v19 = new uint256[](MEM[v14]);
+            MCOPY(v19.data, v14 + 32, MEM[v14]);
+            MEM[MEM[64] + MEM[v14] + 68] = 0;
+            revert(Error(v19));
+            // [ANN] below: the real body (Dedaub placed it after the revert). Note: view quotes do NOT take the reentrancy lock.
+            v20, v21, v22, v23, v24 = 0x39c1(v2);
+            if (v20) {
+                v25 = 0x2b33();
+                require(v2 < 2, Panic(33)); // failed convertion to enum type
+                if (v2) {
+                    v26 = v27 = 0x3aff(v21);
+                    v28 = 0x3bcc(v22);
+                    v29 = 0x2b7a();
+                    if (uint128(v28) == uint128.max) {
+                        v30 = new bytes[](v29.length);
+                        MCOPY(v30.data, v29.data, v30.length);
+                        v30[v29.length] = 0;
+                        revert(Error(v30));
+                    } else {
+                        v31 = v32 = 0x3b89(v28);
+                        v33 = v34 = new struct(20);
+                        require(!((v34 + 640 > uint64.max) | (v34 + 640 < v34)), Panic(65)); // failed memory allocation (too much memory)
+                        // [ANN] inlined ladder load, BASE side: storage slots 8..27. Slot layout (from decoding):
+                        //       bits 0..159 = amount (address-typed), bits 160..223 = multiplier (u64), bit 224.. = end-of-book flag.
+                        v35 = v36 = 8;
+                        v37 = v38 = 0;
+                        while (v37 < 20) {
+                            v39 = new struct(3);
+                            require(!((v39 + 96 > uint64.max) | (v39 + 96 < v39)), Panic(65)); // failed memory allocation (too much memory)
+                            v39.word0 = address(STORAGE[v35]);
+                            v39.word1 = uint64(STORAGE[v35] >> 160);
+                            v39.word2 = bool(STORAGE[v35] >> 224);
+                            MEM[v33] = v39;
+                            v33 = v33 + 32;
+                            v35 = v35 + 1;
+                            v37 = v37 + 1;
+                        }
+                        v40 = v41 = stor_4;
+                        v42 = v43 = _poolState;
+                    }
+                } else {
+                    v44 = 0x3bcc(v21);
+                    v45 = 0x2b7a();
+                    if (uint128(v44) == uint128.max) {
+                        v46 = new bytes[](v45.length);
+                        MCOPY(v46.data, v45.data, v46.length);
+                        v46[v45.length] = 0;
+                        revert(Error(v46));
+                    } else {
+                        v26 = v47 = 0x3b89(v44);
+                        v31 = v48 = 0x3aff(v22);
+                        v33 = v49 = new struct(20);
+                        require(!((v49 + 640 > uint64.max) | (v49 + 640 < v49)), Panic(65)); // failed memory allocation (too much memory)
+                        // [ANN] inlined ladder load, QUOTE side: storage slots 28..47
+                        v50 = v51 = 28;
+                        v52 = v53 = 0;
+                        while (v52 < 20) {
+                            v54 = new struct(3);
+                            require(!((v54 + 96 > uint64.max) | (v54 + 96 < v54)), Panic(65)); // failed memory allocation (too much memory)
+                            v54.word0 = address(STORAGE[v50]);
+                            v54.word1 = uint64(STORAGE[v50] >> 160);
+                            v54.word2 = bool(STORAGE[v50] >> 224);
+                            MEM[v33] = v54;
+                            v33 = v33 + 32;
+                            v50 = v50 + 1;
+                            v52 = v52 + 1;
+                        }
+                        v40 = v55 = _poolState;
+                        v42 = v56 = stor_4;
+                    }
+                }
+                // [ANN] flow netting, as in the swap functions
+                if (stor_5_9_9) {
+                    v57 = _SafeMul(v42, uint128(v31));
+                    if (v40 <= v57 / 10 ** 18) {
+                        v40 = v58 = 0;
+                    } else {
+                        v40 = v59 = _SafeSub(v40, v57 / 10 ** 18);
+                    }
+                }
+                // [ANN] 0x34e5 = fee calculator copy (see 0x15bb). Returns (rejected/expired, feePpm).
+                v60, v61 = 0x34e5(v2, v23);
+                if (!v60) {
+                    if (uint32(v61)) {
+                        // [ANN] gross-up input by fee (ceil)
+                        v2 = v62 = 0x3c41(v2, v61);
+                        if (v62 == uint256.max) {
+                            v63 = v64 = uint256.max;
+                            // Unknown jump to Block 0x198d0x18f9. Refer to 3-address code (TAC);
+                        }
+                    }
+                    // [ANN] exclusion-block lookup, see swaps
+                    v65, v66 = _poolManager.staticcall(0x8c4cdb4900000000000000000000000000000000000000000000000000000000).gas(msg.gas);
+                    require(v65, MEM[64], RETURNDATASIZE());
+                    v66 = v67 = 0;
+                    if (v65) {
+                        v68 = v69 = 32;
+                        if (32 > RETURNDATASIZE()) {
+                            v68 = v70 = RETURNDATASIZE();
+                        }
+                        require(!((MEM[64] + (v68 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (MEM[64] + (v68 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+                        require(MEM[64] + v68 - MEM[64] >= 32);
+                    }
+                    v2 = v71 = 0x51ff5;
+                    // [ANN] excluded-levels count (stor_5_8_8) only while block.number < exclusion block
+                    if (block.number >= v66) {
+                        v72 = v73 = 0;
+                    } else {
+                        v72 = v74 = stor_5_8_8;
+                    }
+                    v63 = v75 = 0;
+                    v40 = v76 = 0;
+                    v77 = v78 = 20;
+                    v79 = v80 = 0;
+                    // [ANN] ladder walk (exact-out), identical in structure to the one in 0x4a036fcb; see comments there
+                    while (1) {
+                        v81 = v82 = v79 < uint8(v72);
+                        if (v82) {
+                            v81 = v83 = v79 < v78;
+                        }
+                        if (!v81) {
+                            v77 = v84 = uint8(v72);
+                            while (v77 < 20) {
+                                v85 = 0x3d2b(v33, v77);
+                                if (MEM[MEM[v85] + 64]) {
+                                    break;
+                                } else {
+                                    v86 = 0x3d2b(v33, v77);
+                                    if (v40 >= address(MEM[MEM[v86]])) {
+                                        v87 = 0x3d2b(v33, v77);
+                                        v40 = _SafeSub(v40, address(MEM[MEM[v87]]));
+                                        v77 = v77 + 1;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                            if (v77 != 20) {
+                                v88 = v89 = uint64.max;
+                                while (v77 < 20) {
+                                    v90 = 0x3d2b(v33, v77);
+                                    if (MEM[MEM[v90] + 64]) {
+                                        break;
+                                    } else {
+                                        v91 = 0x3d2b(v33, v77);
+                                        v92 = 0x3d3c();
+                                        if (uint64(v88) <= uint64(MEM[MEM[v91] + 32])) {
+                                            v93 = new bytes[](v92.length);
+                                            MCOPY(v93.data, v92.data, v93.length);
+                                            v93[v92.length] = 0;
+                                            revert(Error(v93));
+                                        } else {
+                                            v94 = 0x3d2b(v33, v77);
+                                            v88 = v95 = uint64(MEM[MEM[v94] + 32]);
+                                            v96 = 0x3d2b(v33, v77);
+                                            v97 = _SafeMul(uint128(v26), uint64(MEM[MEM[v96] + 32]));
+                                            if (v77 - v77) {
+                                                v98 = 0x3d2b(v33, v77);
+                                                v99 = v100 = address(MEM[MEM[v98]]);
+                                            } else {
+                                                v101 = 0x3d2b(v33, v77);
+                                                v99 = v102 = _SafeSub(address(MEM[MEM[v101]]), v40);
+                                            }
+                                            v103 = _SafeMul(v99, v97 / 10 ** 6);
+                                            if (v2 < v103 / 10 ** 18) {
+                                                require(!v2 | (10 ** 18 == v2 * 10 ** 18 / v2), Panic(17)); // arithmetic overflow or underflow
+                                                v104 = _SafeAdd(v2 * 10 ** 18, v97 / 10 ** 6);
+                                                require(v104 - 1 <= v104, Panic(17)); // arithmetic overflow or underflow
+                                                v105 = _SafeDiv(v104 - 1, v97 / 10 ** 6);
+                                                v63 = v106 = _SafeAdd(v63, v105);
+                                                v2 = v107 = 0;
+                                                break;
+                                            } else {
+                                                v63 = _SafeAdd(v63, v99);
+                                                v2 = _SafeSub(v2, v103 / 10 ** 18);
+                                                v77 = v77 + 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (v2) {
+                                    v63 = v108 = uint256.max;
+                                }
+                            }
+                        } else {
+                            v109 = 0x3d2b(v33, v79);
+                            if (MEM[MEM[v109] + 64]) {
+                                v63 = v110 = uint256.max;
+                                // Unknown jump to Block 0x51ff5. Refer to 3-address code (TAC);
+                            } else {
+                                v79 = 0x3cfe(v79);
+                            }
+                        }
+                    }
+                }
+            }
+            v63 = v111 = uint256.max;
+            // Unknown jump to Block ['0x198d0x18f9', '0x51ff5']. Refer to 3-address code (TAC);
+            return v63;
+            // Unknown jump to Block 0x198d0x18f9. Refer to 3-address code (TAC);
+        }
+    }
+
+    function poolManager() public nonPayable {
+        require(msg.data.length - 4 >= 0);
+        return _poolManager;
+    }
+
+    function 0x3d253f20() public nonPayable {
+        require(msg.data.length - 4 >= 0);
+        // [ANN] getter: operator address (low 160 bits of slot 0x32)
+        return address(_disableTrading);
+    }
+
+    function 0x3c0ae986() public nonPayable {
+        require(msg.data.length - 4 >= 0);
+        // [ANN] getter: fingerprint helper (stor_33) address. READ THIS ON-CHAIN to get the paper's "0xfdb...684".
+        return stor_33_0_19;
+    }
+
+    // [ANN] WITHDRAW ERC20s: only _multiSigOwner. (tokens[], amounts[], recipient). Safe-transfer pattern (SafeERC20FailedOperation).
+    //       Pool is vault-like: operator's inventory sits in the pool and can be pulled by the multisig.
+    function 0x2c88026b(address[] varg0, uint256 varg1, address varg2) public nonPayable {
+        require(msg.data.length - 4 >= 96);
+        require(varg0 <= uint64.max);
+        require(varg0 + 35 < msg.data.length);
+        require(varg0.length <= uint64.max, Panic(65)); // failed memory allocation (too much memory)
+        v0 = new address[](varg0.length);
+        require(!((v0 + (32 + (varg0.length << 5) + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (v0 + (32 + (varg0.length << 5) + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < v0)), Panic(65)); // failed memory allocation (too much memory)
+        v1 = v2 = v0.data;
+        require(varg0 + (varg0.length << 5) + 36 <= msg.data.length);
+        v3 = v4 = varg0.data;
+        while (v3 < varg0 + (varg0.length << 5) + 36) {
+            require(!(msg.data[v3] - address(msg.data[v3])));
+            MEM[v1] = msg.data[v3];
+            v3 += 32;
+            v1 += 32;
+        }
+        require(varg1 <= uint64.max);
+        require(varg1 + 35 < msg.data.length);
+        require(varg1.length <= uint64.max, Panic(65)); // failed memory allocation (too much memory)
+        v5 = new uint256[](varg1.length);
+        require(!((v5 + (32 + (varg1.length << 5) + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (v5 + (32 + (varg1.length << 5) + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < v5)), Panic(65)); // failed memory allocation (too much memory)
+        v6 = v7 = v5.data;
+        require(varg1 + (varg1.length << 5) + 36 <= msg.data.length);
+        v8 = v9 = varg1.data;
+        while (v8 < varg1 + (varg1.length << 5) + 36) {
+            MEM[v6] = msg.data[v8];
+            v8 += 32;
+            v6 += 32;
+        }
+        v10 = 0x2ae4();
+        // [ANN] access control: only multisig owner
+        if (msg.sender != _multiSigOwner) {
+            v11 = new bytes[](v10.length);
+            MCOPY(v11.data, v10.data, v11.length);
+            v11[v10.length] = 0;
+            revert(Error(v11));
+        } else {
+            require(!0, Panic(65)); // failed memory allocation (too much memory)
+            if (v5.length != v0.length) {
+                v12 = new bytes[](v13.length);
+                MCOPY(v12.data, v13.data, v12.length);
+                v12[v13.length] = 0;
+                revert(Error(v12));
+            } else {
+                v14 = v15 = 0;
+                while (v14 < v0.length) {
+                    require(v14 < v0.length, Panic(50)); // access an out-of-bounds or negative index of bytesN array or slice
+                    require(v14 < v5.length, Panic(50)); // access an out-of-bounds or negative index of bytesN array or slice
+                    v16 = v17 = address(v0[v14]).transfer(varg2, v5[v14]).gas(msg.gas);
+                    if (!(v17 & (MEM[0] == 1))) {
+                        require(!(!v17 & 0x1), MEM[64], RETURNDATASIZE());
+                        v16 = v18 = !RETURNDATASIZE() & bool((address(v0[v14])).code.size) & v17;
+                    }
+                    require(v16, SafeERC20FailedOperation(address(v0[v14])));
+                    v14 += 1;
+                }
+                exit;
+            }
+        }
+    }
+
+    function quoteToken() public nonPayable {
+        require(msg.data.length - 4 >= 0);
+        return _quoteToken;
+    }
+
+    // [ANN] VIEW QUOTE, EXACT-IN (aggregators' entry point). Reads anchor/spread/refBlock/tag from stor_0 and calls 0x2aa6 (fee calc)
+    //       and 0x329b-style ladder walk (the walk is inlined in 0x329b). Returns net output (after fee) or 0 if unavailable/expired.
+    //       This is the function aggregators call on the previous block's end state => the quote that "spoofing" exploits.
+    function 0x21523c7e(uint256 varg0, uint256 varg1, address varg2) public nonPayable {
+        require(msg.data.length - 4 >= 96);
+        require(varg0 < 2);
+        v0 = 0x2a25();
+        if (!_tradingEnabled) {
+            v1 = new bytes[](v0.length);
+            MCOPY(v1.data, v0.data, v0.length);
+            v1[v0.length] = 0;
+            revert(Error(v1));
+        } else {
+            v2 = v3 = _poolManager;
+            v4, v5 = v3.isActive().gas(msg.gas);
+            require(v4, MEM[64], RETURNDATASIZE());
+            v2 = v6 = 32;
+            v7 = v8 = 0x51ddb;
+            v7 = v9 = 7624;
+            v7 = v10 = 6541;
+            v5 = v11 = 0;
+            if (v4) {
+                if (v6 > RETURNDATASIZE()) {
+                    require(!((MEM[64] + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (MEM[64] + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+                    MEM[64] = MEM[64] + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0);
+                    v12 = v13 = MEM[64] + RETURNDATASIZE();
+                } else {
+                    require(!((MEM[64] + 32 > uint64.max) | (MEM[64] + 32 < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+                    MEM[64] = MEM[64] + 32;
+                    v12 = v14 = MEM[64] + v6;
+                }
+                require(v12 - MEM[64] >= 32);
+                require(!0x22f3e2d3ffffffffffffffffffffffffffffffffffffffffffffffffffffffff);
+                v15 = v16 = 0x284a();
+            } else {
+                v15 = v17 = 0x284a();
+            }
+            while (v5) {
+                // Unknown jump to Block ['0x1dc8', '0x51ddb']. Refer to 3-address code (TAC);
+                v15 = v18 = 0x2885();
+                v5 = v19 = msg.sender == v2;
+            }
+            v20 = new uint256[](MEM[v15]);
+            MCOPY(v20.data, v15 + 32, MEM[v15]);
+            MEM[MEM[64] + MEM[v15] + 68] = 0;
+            revert(Error(v20));
+            // [ANN] gross output from the ladder walk (see 0x329b; returns 0 if insufficient liquidity)
+            v21 = v22 = 0x329b(v2, v7);
+            // [ANN] 0x2aa6(spread, anchor, refBlock, tag, side): fee calc; args are decoded from stor_0 here:
+            //       uint24(stor_0>>56)=spread, uint128(stor_0>>80)=anchor, uint40(stor_0>>208)=refBlock, byte(stor_0,0)=tag.
+            //       [PAPER] "Each price update records a reference block alongside the anchor price."
+            v23, v24 = 0x2aa6(uint24(stor_0 >> 56), uint128(stor_0 >> 80), uint40(stor_0 >> 208), byte(stor_0, 0x0), v2);
+            if (v23) {
+                // [ANN] expired quote => quote returns 0
+                v21 = v25 = 0;
+                // Unknown jump to Block 0x198d0x1d39. Refer to 3-address code (TAC);
+            } else if (uint32(v24)) {
+                // [ANN] apply fee: out * (1e6 - fee) / 1e6
+                v26 = 0x2c2c(uint32(v24));
+                v27 = _SafeMul(v22, v26);
+                v21 = v28 = v27 / 10 ** 6;
+                // Unknown jump to Block 0x198d0x1d39. Refer to 3-address code (TAC);
+            }
+            return v21;
+        }
+    }
+
+    // TODO: figure out wtf is this....
+    // [ANN] MANAGER-ONLY RECONFIGURATION (called by _poolManager). The "AI-tweaked" version rendered this as a no-op; the raw code
+    //       shows it resets both accumulators and rewrites ALL parameter slots (5, 6, 7) with validation (fees <= 1e6 ppm):
+    //       varg4 -> base fee (stor_5_0_3), varg5/6/7 -> age params, varg2 -> accumulator factor (stor_5_4_7), varg3 -> netting flag, etc.
+    //       NB: argument naming from Dedaub is shifted by the require(...) type checks; follow the storage writes.
+    function 0x209dab1e(address varg0, address varg1, address varg2, address varg3, uint256 varg4, uint256 varg5, uint32 varg6, uint32 varg7, bool varg8, uint32 varg9, uint32 varg10, uint64 varg11, uint64 varg12) public nonPayable {
+        require(msg.data.length - 4 >= 832);
+        v0, v1 = _poolManager.isActive().gas(msg.gas);
+        require(v0, MEM[64], RETURNDATASIZE());
+        v2 = v3 = 7780;
+        v2 = v4 = 0x51e27;
+        v1 = v5 = 0;
+        if (v0) {
+            if (32 > RETURNDATASIZE()) {
+                require(!((MEM[64] + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (MEM[64] + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+                MEM[64] = MEM[64] + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0);
+                v6 = v7 = MEM[64] + RETURNDATASIZE();
+            } else {
+                require(!((MEM[64] + 32 > uint64.max) | (MEM[64] + 32 < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+                MEM[64] = MEM[64] + 32;
+                v6 = v8 = MEM[64] + 32;
+            }
+            require(v6 - MEM[64] >= 32);
+            require(!0x22f3e2d3ffffffffffffffffffffffffffffffffffffffffffffffffffffffff);
+            v9 = v10 = 0x284a();
+        } else {
+            v9 = v11 = 0x284a();
+        }
+        // [ANN] only the poolManager may call this (msg.sender == _poolManager), else revert
+        while (v1) {
+            // Unknown jump to Block ['0x1e64', '0x51e27']. Refer to 3-address code (TAC);
+            v9 = v12 = 0x2885();
+            v1 = v13 = msg.sender == _poolManager;
+        }
+        v14 = new uint256[](MEM[v9]);
+        MCOPY(v14.data, v9 + 32, MEM[v9]);
+        MEM[MEM[64] + MEM[v9] + 68] = 0;
+        revert(Error(v14));
+        require(!0, Panic(65)); // failed memory allocation (too much memory)
+        if (bool(!varg0)) {
+            v15 = new bytes[](v16.length);
+            MCOPY(v15.data, v16.data, v15.length);
+            v15[v16.length] = 0;
+            revert(Error(v15));
+        } else {
+            require(!0, Panic(65)); // failed memory allocation (too much memory)
+            if (bool(!varg1)) {
+                MEM[MEM[64]] = 0x8c379a000000000000000000000000000000000000000000000000000000000;
+                v17 = new bytes[](v18.length);
+                MCOPY(v17.data, v18.data, v17.length);
+                v17[v18.length] = 0;
+                revert(Error(v17));
+            } else {
+                require(!0, Panic(65)); // failed memory allocation (too much memory)
+                if (varg0 == varg1) {
+                    MEM[MEM[64]] = 0x8c379a000000000000000000000000000000000000000000000000000000000;
+                    v19 = new bytes[](v20.length);
+                    MCOPY(v19.data, v20.data, v19.length);
+                    v19[v20.length] = 0;
+                    revert(Error(v19));
+                } else {
+                    require(!(varg4 - uint32(varg4)));
+                    v21 = 0x298d();
+                    // [ANN] every ppm-valued fee must be <= 1e6 (100%)
+                    if (uint32(varg4) > 10 ** 6) {
+                        v22 = new bytes[](v21.length);
+                        MCOPY(v22.data, v21.data, v22.length);
+                        v22[v21.length] = 0;
+                        revert(Error(v22));
+                    } else {
+                        require(!(varg8 - uint32(varg8)));
+                        v23 = 0x298d();
+                        if (uint32(varg8) > 10 ** 6) {
+                            v24 = new bytes[](v23.length);
+                            MCOPY(v24.data, v23.data, v24.length);
+                            v24[v23.length] = 0;
+                            revert(Error(v24));
+                        } else {
+                            require(!(varg2 - uint32(varg2)));
+                            v25 = 0x29c8();
+                            if (uint32(varg2) > 10 ** 6) {
+                                v26 = new bytes[](v25.length);
+                                MCOPY(v26.data, v25.data, v26.length);
+                                v26[v25.length] = 0;
+                                revert(Error(v26));
+                            } else {
+                                // [ANN] reset flow accumulators (fresh book)
+                                _poolState = 0;
+                                stor_4 = 0;
+                                require(!(varg4 - uint32(varg4)));
+                                // [ANN] BASE fee
+                                stor_5_0_3 = varg4;
+                                require(!(varg5 - uint64(varg5)));
+                                require(!(varg6 - uint64(varg6)));
+                                // [ANN] AGE params (slot 6): expiry / grace / coef / cap
+                                stor_6_0_7 = varg5;
+                                stor_6_16_19 = varg7;
+                                stor_6_8_15 = varg6;
+                                require(!(varg8 - uint32(varg8)));
+                                stor_6_20_23 = varg8;
+                                require(!(varg2 - uint32(varg2)));
+                                require(!(varg3 - bool(varg3)));
+                                // [ANN] accumulator factor + netting flag
+                                stor_5_4_7 = varg2;
+                                stor_5_9_9 = bool(varg3);
+                                require(!(varg10 - bool(varg10)));
+                                require(!(varg12 - uint32(varg12)));
+                                require(!(varg11 - uint32(varg11)));
+                                // [ANN] ADDRESS fee, whitelist-only mode, PRIORITY multiplier and PRIORITY fee (slot 7)
+                                stor_7_0_3 = varg9;
+                                stor_7_4_4 = bool(varg10);
+                                stor_7_5_8 = varg11;
+                                stor_7_9_12 = varg12;
+                                return ;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // [ANN] BOOK UPDATE (operator only): replaces both ladders (up to 19 levels each + terminator) and resets the accumulators.
+    //       [PAPER] "updating the book levels" (152,013 median gas, ~1 per 4.31 blocks), vs. p/s updates (26.7k gas).
+    //       Each level is calldata struct {address amount; uint64 multiplier; bool end} = 96 bytes, written packed into one slot:
+    //       slot = amount(160) | multiplier(64)<<160 | end<<224. Base ladder -> slots 8.., quote ladder -> slots 28..
+    //       After the last level a terminator entry (end flag set via 0x1000...) is written (bounds the walk loops).
+    function 0xdba310cf(uint256 varg0) public nonPayable {
+        require(msg.data.length - 4 >= 32);
+        require(varg0 <= uint64.max);
+        require(msg.data.length - varg0 - 4 >= 64);
+        // [ANN] operator-only (NotOperator)
+        require(!(msg.sender - address(_disableTrading)), NotOperator());
+        // [ANN] flow accumulators reset: new book => depletion starts over
+        stor_4 = 0;
+        _poolState = 0;
+        require(varg0.length < msg.data.length - (4 + varg0) - 31);
+        require(msg.data[4 + varg0 + varg0.length] <= uint64.max);
+        require(32 + (4 + varg0 + varg0.length) <= msg.data.length - msg.data[4 + varg0 + varg0.length] * 96);
+        // [ANN] max 19 levels per side (index 19 reserved for terminator): TooManyOrders()
+        require(msg.data[4 + varg0 + varg0.length] <= 19, TooManyOrders());
+        require(msg.data[varg0.data] < msg.data.length - (4 + varg0) - 31);
+        require(msg.data[4 + varg0 + msg.data[varg0.data]] <= uint64.max);
+        require(32 + (4 + varg0 + msg.data[varg0.data]) <= msg.data.length - msg.data[4 + varg0 + msg.data[varg0.data]] * 96);
+        require(msg.data[4 + varg0 + msg.data[varg0.data]] <= 19, TooManyOrders());
+        v0 = v1 = 0;
+        // [ANN] write BASE-side ladder to slots 8..(8+n-1)
+        while (v0 < msg.data[4 + varg0 + varg0.length]) {
+            require(varg0.length < msg.data.length - (4 + varg0) - 31);
+            require(msg.data[4 + varg0 + varg0.length] <= uint64.max);
+            require(32 + (4 + varg0 + varg0.length) <= msg.data.length - msg.data[4 + varg0 + varg0.length] * 96);
+            v2 = 0x3189(32 + (4 + varg0 + varg0.length), msg.data[4 + varg0 + varg0.length], v0);
+            require(!(msg.data[v2] - address(msg.data[v2])));
+            require(!(msg.data[v2 + 32] - uint64(msg.data[v2 + 32])));
+            require(!(msg.data[v2 + 64] - bool(msg.data[v2 + 64])));
+            v3 = new struct(3);
+            require(!((v3 + 96 > uint64.max) | (v3 + 96 < v3)), Panic(65)); // failed memory allocation (too much memory)
+            v3.word0 = address(msg.data[v2]);
+            v3.word1 = uint64(msg.data[v2 + 32]);
+            v3.word2 = bool(msg.data[v2 + 64]);
+            require(v0 < 20, Panic(50)); // access an out-of-bounds or negative index of bytesN array or slice
+            // [ANN] packing: amount in low 160 bits, multiplier in bits 160..223, end flag at bit 224
+            STORAGE[v0 + 8] = 0xff00000000000000000000000000000000000000000000000000000000 & bool(v3.word2) << 224 | (0xffffffffffffffff0000000000000000000000000000000000000000 & v3.word1 << 160 | (address(v3.word0) | bytes3(STORAGE[v0 + 8])));
+            v0 += 1;
+        }
+        require(!((MEM[64] + 96 > uint64.max) | (MEM[64] + 96 < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+        require(msg.data[4 + varg0 + varg0.length] < 20, Panic(50)); // access an out-of-bounds or negative index of bytesN array or slice
+        // [ANN] TERMINATOR for the base ladder: slot gets amount=0, multiplier=0, end flag = 1 (0x01 << 224)
+        STORAGE[8 + msg.data[4 + varg0 + varg0.length]] = bytes12(STORAGE[8 + msg.data[4 + varg0 + varg0.length]]) | address(0x0);
+        STORAGE[8 + msg.data[4 + varg0 + varg0.length]] = STORAGE[8 + msg.data[4 + varg0 + varg0.length]] & 0xffffffff0000000000000000ffffffffffffffffffffffffffffffffffffffff | 0x0;
+        STORAGE[8 + msg.data[4 + varg0 + varg0.length]] = STORAGE[8 + msg.data[4 + varg0 + varg0.length]] & 0xffffff000000000000000000ffffffffffffffffffffffffffffffffffffffff | 0x0 | 0x100000000000000000000000000000000000000000000000000000000;
+        v4 = v5 = 0;
+        // [ANN] write QUOTE-side ladder to slots 28.. (via 0x31ba)
+        while (v4 < msg.data[4 + varg0 + msg.data[varg0.data]]) {
+            require(msg.data[varg0.data] < msg.data.length - (4 + varg0) - 31);
+            require(msg.data[4 + varg0 + msg.data[varg0.data]] <= uint64.max);
+            require(32 + (4 + varg0 + msg.data[varg0.data]) <= msg.data.length - msg.data[4 + varg0 + msg.data[varg0.data]] * 96);
+            v6 = 0x3189(32 + (4 + varg0 + msg.data[varg0.data]), msg.data[4 + varg0 + msg.data[varg0.data]], v4);
+            require(!(msg.data[v6] - address(msg.data[v6])));
+            require(!(msg.data[v6 + 32] - uint64(msg.data[v6 + 32])));
+            require(!(msg.data[v6 + 64] - bool(msg.data[v6 + 64])));
+            v7 = new struct(3);
+            require(!((v7 + 96 > uint64.max) | (v7 + 96 < v7)), Panic(65)); // failed memory allocation (too much memory)
+            v7.word0 = address(msg.data[v6]);
+            v7.word1 = uint64(msg.data[v6 + 32]);
+            v7.word2 = bool(msg.data[v6 + 64]);
+            v8, v9 = 0x31ba(v4);
+            require(!v8, Panic(0));
+            STORAGE[v9] = bytes3(STORAGE[v9]) | address(v7.word0) | v7.word1 << 160 & 0xffffffffffffffff0000000000000000000000000000000000000000 | bool(v7.word2) << 224 & 0xff00000000000000000000000000000000000000000000000000000000;
+            v4 = v4 + 1;
+        }
+        require(!((MEM[64] + 96 > uint64.max) | (MEM[64] + 96 < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+        // [ANN] TERMINATOR for the quote ladder
+        v10, v11 = 0x31ba(msg.data[4 + varg0 + msg.data[varg0.data]]);
+        require(!v10, Panic(0));
+        STORAGE[v11] = bytes3(STORAGE[v11]) | address(0x0) | 0x0 | 0x100000000000000000000000000000000000000000000000000000000;
+    }
+
+    // [ANN] disableTrading(): operator OR poolManager can pause the pool (see enableTrading)
+    function disableTrading() public nonPayable {
+        require(msg.data.length - 4 >= 0);
+        v0 = v1 = msg.sender == address(_disableTrading);
+        if (msg.sender != address(_disableTrading)) {
+            v0 = v2 = msg.sender == _poolManager;
+        }
+        v3 = 0x2778();
+        if (!v0) {
+            v4 = new bytes[](v3.length);
+            MCOPY(v4.data, v3.data, v4.length);
+            v4[v3.length] = 0;
+            revert(Error(v4));
+        } else {
+            _tradingEnabled = 0;
+            exit;
+        }
+    }
+
+    // [ANN] SET DEFAULT FEE (operator only). The argument is obfuscated: varg0 = ~(0xdeadbeef.. ^ newValue) where newValue is a 96-bit
+    //       value whose LOW 64 bits must equal block.number ("block-bound" tx, i.e. only valid in the intended block).
+    //       The decoded value's top 32 bits (<<96 -> bits 160..191 of slot 0x32) become the DEFAULT fee ppm (read via 0x760f6a4c).
+    //       => this is the cheap per-block fee flip: raise default fee at start of block, drop it at end of block.
+    //       [PAPER] Sec 7.4 "Spoofing", Fig. 7a / Fig. 11: default-fee decreases cluster in the last tenth of the block, increases in the first.
+    function 0x1667d875(uint96 varg0) public nonPayable {
+        require(msg.data.length - 4 >= 32);
+        require(!(msg.sender - address(_disableTrading)), NotOperator());
+        if (uint64(block.number) == uint64(~(0xdeadbeefdeadbeefdeadbeef ^ varg0))) {
+            _disableTrading = 0xffffffff0000000000000000000000000000000000000000 & ~(0xdeadbeefdeadbeefdeadbeef ^ varg0) << 96 | 0xffffffffffffffff00000000ffffffffffffffffffffffffffffffffffffffff & _disableTrading;
+            exit;
+        } else {
+            // [ANN] wrong block => silent no-op (prevents stale default-fee txs from landing late)
+            exit;
+        }
+    }
+
+    function multiSigOwner() public nonPayable {
+        require(msg.data.length - 4 >= 0);
+        return _multiSigOwner;
+    }
+
+    // [ANN] 0x25cc: loads the AGE-fee parameter struct (slot 6): {expiryAge, grace, coef, cap}. Consumed by 0x4494.
+    function 0x25cc() private {
+        v0 = new struct(4);
+        require(!((v0 + 128 > uint64.max) | (v0 + 128 < v0)), Panic(65)); // failed memory allocation (too much memory)
+        v0.word0 = stor_6_0_7;
+        v0.word1 = stor_6_8_15;
+        v0.word2 = stor_6_16_19;
+        v0.word3 = stor_6_20_23;
+        return v0;
+    }
+
+    // [ANN] 0x2629: load BASE ladder (slots 8..27) into memory. 20 levels max. Entry = {amount, multiplier, end-flag}.
+    function 0x2629() private {
+        v0 = v1 = new struct(20);
+        require(!((v1 + 640 > uint64.max) | (v1 + 640 < v1)), Panic(65)); // failed memory allocation (too much memory)
+        v2 = v3 = 8;
+        v4 = v5 = 0;
+        while (v4 < 20) {
+            v6 = new struct(3);
+            require(!((v6 + 96 > uint64.max) | (v6 + 96 < v6)), Panic(65)); // failed memory allocation (too much memory)
+            v6.word0 = address(STORAGE[v2]);
+            v6.word1 = uint64(STORAGE[v2] >> 160);
+            v6.word2 = bool(STORAGE[v2] >> 224);
+            MEM[v0] = v6;
+            v0 = v0 + 32;
+            v2 = v2 + 1;
+            v4 = v4 + 1;
+        }
+        return v1;
+    }
+
+    // [ANN] 0x26a2: load QUOTE ladder (slots 28..47) into memory.
+    function 0x26a2() private {
+        v0 = v1 = new struct(20);
+        require(!((v1 + 640 > uint64.max) | (v1 + 640 < v1)), Panic(65)); // failed memory allocation (too much memory)
+        v2 = v3 = 28;
+        v4 = v5 = 0;
+        while (v4 < 20) {
+            v6 = new struct(3);
+            require(!((v6 + 96 > uint64.max) | (v6 + 96 < v6)), Panic(65)); // failed memory allocation (too much memory)
+            v6.word0 = address(STORAGE[v2]);
+            v6.word1 = uint64(STORAGE[v2] >> 160);
+            v6.word2 = bool(STORAGE[v2] >> 224);
+            MEM[v0] = v6;
+            v0 = v0 + 32;
+            v2 = v2 + 1;
+            v4 = v4 + 1;
+        }
+        return v1;
+    }
+
+    // [ANN] 0x271b: copy memory ladders into the ABI return array (used by poolState())
+    function 0x271b(uint256 varg0, uint256 varg1) private {
+        v0 = v1 = 0;
+        while (v0 < 20) {
+            MEM[varg1] = address(MEM[MEM[varg0]]);
+            MEM[varg1 + 32] = uint64(MEM[MEM[varg0] + 32]);
+            MEM[varg1 + 64] = bool(MEM[MEM[varg0] + 64]);
+            varg1 = varg1 + 96;
+            varg0 = varg0 + 32;
+            v0 = v0 + 1;
+        }
+        return ;
+    }
+
+    // [ANN] 0x2778: returns pointer to a revert-string constant (access-control message for enable/disableTrading). Same pattern for
+    //       0x284a, 0x2885, 0x298d, 0x29c8, 0x2a25, 0x2ae4, 0x2b7a, 0x2f64, 0x2f9f, 0x2fda, 0x3089, 0x3d3c: each returns a pointer
+    //       to a "T<number>" error string (0x5431xx..0x5433xx = ASCII "T11".."T36"-style codes). Not worth decoding individually.
+    function 0x2778() private {
+        require(!0, Panic(65)); // failed memory allocation (too much memory)
+        return 21558;
+    }
+
+    function 0x284a() private {
+        require(!0, Panic(65)); // failed memory allocation (too much memory)
+        return 0x543136;
+    }
+
+    function 0x2885() private {
+        require(!0, Panic(65)); // failed memory allocation (too much memory)
+        return 21556;
+    }
+
+    function 0x298d() private {
+        require(!0, Panic(65)); // failed memory allocation (too much memory)
+        return 0x543233;
+    }
+
+    function 0x29c8() private {
+        require(!0, Panic(65)); // failed memory allocation (too much memory)
+        return 0x543234;
+    }
+
+    function 0x2a25() private {
+        require(!0, Panic(65)); // failed memory allocation (too much memory)
+        return 0x543137;
+    }
+
+    // [ANN] 0x2aa6: FEE CALCULATOR copy used by the view quote 0x21523c7e. Args: (spread, anchor, refBlock, tag, caller).
+    //       Identical logic to 0x15bb / 0x34e5 / 0x3786. Returns (expired, feePpm).
+    function 0x2aa6(uint256 varg0, uint256 varg1, uint256 varg2, uint256 varg3, uint256 varg4) private {
+        v0 = 0x25cc();
+        // [ANN] AGE: 0x4494(ageParams, refBlock=varg2, block.number); uint32.max => expired, no fill
+        v1 = v2 = 0x4494(v0, varg2, uint64(block.number));
+        if (uint32(v2) == uint32.max) {
+            return 1, 0;
+        } else {
+            // [ANN] BASE
+            v1 = v3 = stor_5_0_3;
+            v1 = v4 = _poolManager;
+            v5 = v6 = MEM[64];
+            // [ANN] ADDRESS label of caller (varg4)
+            v7 = v4.staticcall(0x8547d97200000000000000000000000000000000000000000000000000000000, address(varg4)).gas(msg.gas);
+            require(v7, MEM[64], RETURNDATASIZE());
+            v1 = v8 = 0;
+            if (v7) {
+                v9 = v10 = 14198;
+                if (32 <= RETURNDATASIZE()) {
+                    require(!((v6 + 32 > uint64.max) | (v6 + 32 < v6)), Panic(65)); // failed memory allocation (too much memory)
+                    MEM[64] = v6 + 32;
+                    v11 = v12 = v6 + 32;
+                }
+            }
+            v5 = v13 = MEM[64];
+            // [ANN] ADDRESS label of tx.origin
+            v14 = v1.staticcall(0x8547d97200000000000000000000000000000000000000000000000000000000, tx.origin).gas(msg.gas);
+            if (!v14) {
+                RETURNDATACOPY(MEM[64], 0, RETURNDATASIZE());
+                revert(MEM[64], RETURNDATASIZE());
+            } else {
+                v1 = v15 = 0;
+                if (v14) {
+                    v1 = v16 = uint16.max;
+                    v9 = v17 = 14158;
+                    v18 = v19 = 32;
+                    if (32 > RETURNDATASIZE()) {
+                        // Unknown jump to Block 0x37550x2aa6. Refer to 3-address code (TAC);
+                    }
+                }
+            }
+            v20 = uint16(v1);
+            require(v20 < 4, Panic(33)); // failed convertion to enum type
+            require(uint16(v1) < 4, Panic(33)); // failed convertion to enum type
+            v1 = v21 = 0x521b2;
+            v1 = v22 = 32;
+            v1 = v23 = 0x521d7;
+            v1 = v24 = 0x521fb;
+            v1 = v25 = 4;
+            v1 = v26 = 13870;
+            // [ANN] exempt (label 1) => DEFAULT fee = 0; else DEFAULT = _disableTrading >> 160
+            v27 = v28 = v20 == 1;
+            if (v20 != 1) {
+                v27 = v29 = uint16(v1) == 1;
+            }
+            if (!v27) {
+                v1 = v30 = uint32(_disableTrading >> 160);
+            } else {
+                v1 = v31 = 0;
+            }
+            while (1) {
+                v1 = uint32(v1) + uint32(v1);
+                require(v1 <= uint32.max, Panic(17)); // arithmetic overflow or underflow
+                // Unknown jump to Block ['0x362e0x2aa6', '0x36ad0x2aa6', '0x521b20x2aa6', '0x521d70x2aa6', '0x522200x2aa6']. Refer to 3-address code (TAC);
+                // [ANN] PRIORITY reference (selector 0xeb101276), see 0x15bb
+                v32 = v1.staticcall(0xeb10127600000000000000000000000000000000000000000000000000000000).gas(msg.gas);
+                if (!v32) {
+                    RETURNDATACOPY(MEM[64], 0, RETURNDATASIZE());
+                    revert(MEM[64], RETURNDATASIZE());
+                } else {
+                    v33 = v34 = 0;
+                    if (v32) {
+                        v35 = v36 = 32;
+                        if (32 > RETURNDATASIZE()) {
+                            v35 = v37 = RETURNDATASIZE();
+                        }
+                        require(!((MEM[64] + (v35 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (MEM[64] + (v35 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+                        require(MEM[64] + v35 - MEM[64] >= 32);
+                    }
+                    v1 = v38 = 0x52220;
+                    v1 = v39 = 0;
+                    v1 = v40 = 13997;
+                    // [ANN] PRIORITY: (gasprice - basefee) vs R * stor_7_5_8 / 1e6 -> charge stor_7_9_12
+                    v41 = _SafeMul(v33, stor_7_5_8);
+                    v42 = 0x48d5();
+                    if (v39 != v42 > v41 / 10 ** 6) {
+                        v1 = v43 = stor_7_9_12;
+                    }
+                }
+            }
+            // [ANN] cap at 100%
+            if (uint32(v1) > 10 ** 6) {
+                return 0, 10 ** 6;
+            } else {
+                return 0, v1;
+            }
+            // [ANN] ---- remainder: address classification (same as 0x15bb tail): whitelist-only mode, blacklist revert,
+            //       penalized => ADDRESS fee + 500-iteration gas loop, else fingerprint helper (0x481b) => ADDRESS fee ----
+            v1 = v44 = _poolManager;
+            v5 = v45 = MEM[64];
+            v46 = address(v1);
+            v47 = v44.staticcall(0x8547d97200000000000000000000000000000000000000000000000000000000, v46).gas(msg.gas);
+            if (!v47) {
+                RETURNDATACOPY(MEM[64], 0, RETURNDATASIZE());
+                revert(MEM[64], RETURNDATASIZE());
+            } else {
+                v1 = v48 = 36;
+                v1 = v49 = 0;
+                if (v47) {
+                    v1 = v50 = 32;
+                    v9 = v51 = 18452;
+                    if (v50 <= RETURNDATASIZE()) {
+                        require(!((v45 + 32 > uint64.max) | (v45 + 32 < v45)), Panic(65)); // failed memory allocation (too much memory)
+                        MEM[64] = v45 + 32;
+                        v11 = v52 = v45 + v50;
+                    }
+                }
+            }
+            require(!((v5 + (v18 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (v5 + (v18 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < v5)), Panic(65)); // failed memory allocation (too much memory)
+            MEM[64] = v5 + (v18 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0);
+            v11 = v53 = v5 + v18;
+            require(v11 - v5 >= 32);
+            v1 = v54 = MEM[v5];
+            require(!(v54 - uint16(v54)));
+            // Unknown jump to Block ['0x374e0x2aa6', '0x37760x2aa6', '0x47f20x2aa6', '0x48140x2aa6']. Refer to 3-address code (TAC);
+            // Unknown jump to Block 0x35d40x2aa6. Refer to 3-address code (TAC);
+            v55 = uint16(v1);
+            require(v55 < 4, Panic(33)); // failed convertion to enum type
+            v56 = v57 = uint16(v1) >= 4;
+            require(!v57, Panic(33)); // failed convertion to enum type
+            if (stor_7_4_4) {
+                require(!(v55 - 1), AddressNotWhitelisted());
+                v1 = v58 = 0;
+            } else {
+                require(v55 < 4, Panic(33)); // failed convertion to enum type
+                v59 = v60 = v55 == 3;
+                if (v55 != 3) {
+                    v56 = v61 = 0;
+                    v59 = v62 = uint16(v1) == 3;
+                }
+                require(!v59, AddressBlacklisted());
+                v63 = v64 = 2 == v55;
+                if (2 != v55) {
+                    require(!v56, Panic(33)); // failed convertion to enum type
+                    v63 = v65 = 2 == uint16(v1);
+                }
+                if (v63) {
+                    v66 = v67 = 0;
+                    while (v66 < 500) {
+                        v68 = new struct(2);
+                        v69 = v68.data;
+                        v68.word1 = v66;
+                        v68.word0 = 32;
+                        require(!((v68 + 64 > uint64.max) | (v68 + 64 < v68)), Panic(65)); // failed memory allocation (too much memory)
+                        v66 = v66 + 1;
+                    }
+                    v1 = v70 = stor_7_0_3;
+                    // Unknown jump to Block 0x521fb0x2aa6. Refer to 3-address code (TAC);
+                } else {
+                    v71 = 0x481b(v1);
+                    if (v71) {
+                        v1 = v72 = stor_7_0_3;
+                        // Unknown jump to Block 0x521fb0x2aa6. Refer to 3-address code (TAC);
+                    } else {
+                        v1 = v73 = 0;
+                        // Unknown jump to Block 0x521fb0x2aa6. Refer to 3-address code (TAC);
+                    }
+                }
+            }
+            v5 = v74 = MEM[64];
+            v75 = v1.staticcall(0x8547d97200000000000000000000000000000000000000000000000000000000, tx.origin).gas(msg.gas);
+            if (!v75) {
+                RETURNDATACOPY(MEM[64], 0, RETURNDATASIZE());
+                revert(MEM[64], RETURNDATASIZE());
+            } else {
+                v1 = v76 = 0;
+                if (v75) {
+                    v1 = v77 = uint16.max;
+                    v9 = v78 = 18418;
+                    if (32 <= RETURNDATASIZE()) {
+                        require(!((v74 + 32 > uint64.max) | (v74 + 32 < v74)), Panic(65)); // failed memory allocation (too much memory)
+                        MEM[64] = v74 + 32;
+                        v11 = v79 = v74 + 32;
+                    }
+                }
+            }
+            v18 = v80 = RETURNDATASIZE();
+            // Unknown jump to Block 0x373c0x2aa6. Refer to 3-address code (TAC);
+        }
+    }
+
+    function 0x2ae4() private {
+        require(!0, Panic(65)); // failed memory allocation (too much memory)
+        return 21553;
+    }
+
+    // [ANN] 0x2b33: allocates an empty Order[20] (20 zeroed structs); placeholder that is overwritten by the ladder loads.
+    function 0x2b33() private {
+        v0 = new struct(20);
+        require(!((v0 + 640 > uint64.max) | (v0 + 640 < v0)), Panic(65)); // failed memory allocation (too much memory)
+        v1 = v2 = 0;
+        while (v1 < 640) {
+            require(!((MEM[64] + 96 > uint64.max) | (MEM[64] + 96 < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+            MEM[64] = MEM[64] + 96;
+            MEM[MEM[64]] = 0;
+            MEM[MEM[64] + 32] = 0;
+            MEM[MEM[64] + 64] = 0;
+            MEM[v0 + v1] = MEM[64];
+            v1 = v1 + 32;
+        }
+        return v0;
+    }
+
+    function 0x2b7a() private {
+        require(!0, Panic(65)); // failed memory allocation (too much memory)
+        return 0x543135;
+    }
+
+    function _SafeMul(uint256 varg0, uint256 varg1) private {
+        require((varg0 * varg1 / varg0 == varg1) | !varg0, Panic(17)); // arithmetic overflow or underflow
+        return varg0 * varg1;
+    }
+
+    function _SafeDiv(uint256 varg0, uint256 varg1) private {
+        require(varg1, Panic(18)); // division by zero
+        return varg0 / varg1;
+    }
+
+    // [ANN] 0x2c2c(fee) = 1e6 - fee  (the "(1 - phi)" factor in ppm)
+    function 0x2c2c(uint256 varg0) private {
+        require(10 ** 6 - varg0 <= 10 ** 6, Panic(17)); // arithmetic overflow or underflow
+        return 10 ** 6 - varg0;
+    }
+
+    function _SafeSub(uint256 varg0, uint256 varg1) private {
+        require(varg0 - varg1 <= varg0, Panic(17)); // arithmetic overflow or underflow
+        return varg0 - varg1;
+    }
+
+    function 0x2f64() private {
+        require(!0, Panic(65)); // failed memory allocation (too much memory)
+        return 21559;
+    }
+
+    function 0x2f9f() private {
+        require(!0, Panic(65)); // failed memory allocation (too much memory)
+        return 0x543339;
+    }
+
+    function 0x2fda() private {
+        require(!0, Panic(65)); // failed memory allocation (too much memory)
+        return 0x543132;
+    }
+
+    // [ANN] the only human-readable revert string in the contract: "T8: Insufficient Liquidity" (ladder can't fill the order)
+    function 0x3015() private {
+        require(!(('T8: Insufficient Liquidity' + 64 > uint64.max) | ('T8: Insufficient Liquidity' + 64 < 'T8: Insufficient Liquidity')), Panic(65)); // failed memory allocation (too much memory)
+        return 'T8: Insufficient Liquidity';
+    }
+
+    // [ANN] 0x3050(x) = -x (signed negation, used to return signed deltas)
+    function 0x3050(uint256 varg0) private {
+        require(varg0 != int256.min, Panic(17)); // arithmetic overflow or underflow
+        return 0 - varg0;
+    }
+
+    function _SafeAdd(uint256 varg0, uint256 varg1) private {
+        require(varg0 <= varg0 + varg1, Panic(17)); // arithmetic overflow or underflow
+        return varg0 + varg1;
+    }
+
+    function 0x3089() private {
+        require(!0, Panic(65)); // failed memory allocation (too much memory)
+        return 21555;
+    }
+
+    function 0x3175(uint8 varg0, uint8 varg1) private {
+        require(varg0 - varg1 <= uint8.max, Panic(17)); // arithmetic overflow or underflow
+        return varg0 - varg1;
+    }
+
+    // [ANN] 0x3189(base, len, i): address of element i in a calldata array of 96-byte structs (bounds-checked)
+    function 0x3189(uint256 varg0, uint256 varg1, uint256 varg2) private {
+        require(varg2 < varg1, Panic(50)); // access an out-of-bounds or negative index of bytesN array or slice
+        return 96 * varg2 + varg0;
+    }
+
+    // [ANN] 0x31ba(i): storage slot for quote-ladder level i = 28 + i
+    function 0x31ba(uint256 varg0) private {
+        require(varg0 < 20, Panic(50)); // access an out-of-bounds or negative index of bytesN array or slice
+        return 0, 28 + varg0;
+    }
+
+    // [ANN] 0x329b(side, amountIn): LADDER WALK, EXACT-IN. Returns gross output (before fees), or 0 if the ladder can't fill.
+    //       Steps: trading-enabled + isActive checks -> 0x39c1 (top-of-book price from anchor/spread) -> pick ladder per side
+    //       (inverting price for one side) -> netting with the opposite accumulator (stor_5_9_9) -> exclusion-block lookup ->
+    //       walk levels (skip excluded, burn accumulated volume, then fill level by level with price = anchor * multiplier).
+    function 0x329b(uint256 varg0, uint256 varg1) private {
+        v0 = 0x2a25();
+        if (!_tradingEnabled) {
+            v1 = new bytes[](v0.length);
+            MCOPY(v1.data, v0.data, v0.length);
+            v1[v0.length] = 0;
+            revert(Error(v1));
+        } else {
+            v2, v3 = _poolManager.isActive().gas(msg.gas);
+            require(v2, MEM[64], RETURNDATASIZE());
+            v3 = v4 = 0;
+            if (v2) {
+                if (32 > RETURNDATASIZE()) {
+                    require(!((MEM[64] + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (MEM[64] + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+                    MEM[64] = MEM[64] + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0);
+                    v5 = v6 = MEM[64] + RETURNDATASIZE();
+                } else {
+                    require(!((MEM[64] + 32 > uint64.max) | (MEM[64] + 32 < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+                    MEM[64] = MEM[64] + 32;
+                    v5 = v7 = MEM[64] + 32;
+                }
+                require(v5 - MEM[64] >= 32);
+                require(!0x22f3e2d3ffffffffffffffffffffffffffffffffffffffffffffffffffffffff);
+                v8 = v9 = 0x284a();
+            } else {
+                v8 = v10 = 0x284a();
+            }
+            if (!v3) {
+                v11 = new uint256[](MEM[v8]);
+                MCOPY(v11.data, v8 + 32, MEM[v8]);
+                MEM[MEM[64] + MEM[v8] + 68] = 0;
+                revert(Error(v11));
+            } else {
+                // [ANN] 0x39c1(side): returns (ok, topOfBookPrice, anchor, refBlock, tag) from stor_0
+                v12, v13, v14, v15, v16 = 0x39c1(varg0);
+                if (!v12) {
+                    v17 = v18 = 0;
+                } else {
+                    v19 = 0x2b33();
+                    require(varg0 < 2, Panic(33)); // failed convertion to enum type
+                    if (varg0) {
+                        v20 = v21 = 0x3aff(v13);
+                        v22 = 0x3bcc(v14);
+                        v23 = 0x2b7a();
+                        if (uint128(v22) == uint128.max) {
+                            v24 = new bytes[](v23.length);
+                            MCOPY(v24.data, v23.data, v24.length);
+                            v24[v23.length] = 0;
+                            revert(Error(v24));
+                        } else {
+                            v25 = v26 = 0x3b89(v22);
+                            // [ANN] side 1: use base ladder (0x2629); own accumulator = stor_4, opposite = _poolState
+                            v27 = v28 = 0x2629();
+                            v29 = v30 = stor_4;
+                            v31 = v32 = _poolState;
+                        }
+                    } else {
+                        v33 = 0x3bcc(v13);
+                        v34 = 0x2b7a();
+                        if (uint128(v33) == uint128.max) {
+                            v35 = new bytes[](v34.length);
+                            MCOPY(v35.data, v34.data, v35.length);
+                            v35[v34.length] = 0;
+                            revert(Error(v35));
+                        } else {
+                            v20 = v36 = 0x3b89(v33);
+                            v25 = v37 = 0x3aff(v14);
+                            // [ANN] side 0: use quote ladder (0x26a2); own accumulator = _poolState, opposite = stor_4
+                            v27 = v38 = 0x26a2();
+                            v29 = v39 = _poolState;
+                            v31 = v40 = stor_4;
+                        }
+                    }
+                    // [ANN] NETTING: own -= opposite * price / 1e18 (floored at 0). [PAPER] "directions are netted at the current anchor price p."
+                    if (stor_5_9_9) {
+                        v41 = _SafeMul(v31, uint128(v25));
+                        if (v29 <= v41 / 10 ** 18) {
+                            v29 = v42 = 0;
+                        } else {
+                            v29 = v43 = _SafeSub(v29, v41 / 10 ** 18);
+                        }
+                    }
+                    // [ANN] poolManager.0x8c4cdb49() -> exclusion block
+                    v44, v45 = _poolManager.staticcall(0x8c4cdb4900000000000000000000000000000000000000000000000000000000).gas(msg.gas);
+                    require(v44, MEM[64], RETURNDATASIZE());
+                    v45 = v46 = 0;
+                    if (v44) {
+                        v47 = v48 = 32;
+                        if (32 > RETURNDATASIZE()) {
+                            v47 = v49 = RETURNDATASIZE();
+                        }
+                        require(!((MEM[64] + (v47 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (MEM[64] + (v47 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+                        require(MEM[64] + v47 - MEM[64] >= 32);
+                    }
+                    // [ANN] excluded levels only while block.number < exclusion block
+                    if (block.number >= v45) {
+                        v50 = v51 = 0;
+                    } else {
+                        v50 = v52 = stor_5_8_8;
+                    }
+                    v17 = v53 = 0;
+                    v29 = v54 = 0;
+                    v55 = v56 = 20;
+                    v57 = v58 = 0;
+                    // [ANN] exact-in ladder walk. NOTE: after the netting block the code sets v29 = 0 (a decompiler artefact of
+                    //       variable reuse: the netted accumulator value is carried via the SSA phi, don't read this literally).
+                    //       For each level: gross out += amountIn_consumed * (anchor*multiplier/1e6) / 1e18; remaining input -= level amount.
+                    while (1) {
+                        v59 = v60 = v57 < uint8(v50);
+                        if (v60) {
+                            v59 = v61 = v57 < v56;
+                        }
+                        if (!v59) {
+                            v55 = v62 = uint8(v50);
+                            while (v55 < 20) {
+                                v63 = 0x3d2b(v27, v55);
+                                if (MEM[MEM[v63] + 64]) {
+                                    break;
+                                } else {
+                                    v64 = 0x3d2b(v27, v55);
+                                    if (v29 >= address(MEM[MEM[v64]])) {
+                                        v65 = 0x3d2b(v27, v55);
+                                        v29 = _SafeSub(v29, address(MEM[MEM[v65]]));
+                                        v55 = v55 + 1;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                            if (v55 == 20) {
+                                v17 = v66 = 0;
+                                break;
+                            } else {
+                                v67 = v68 = uint64.max;
+                                while (v55 < 20) {
+                                    v69 = 0x3d2b(v27, v55);
+                                    if (MEM[MEM[v69] + 64]) {
+                                        break;
+                                    } else {
+                                        v70 = 0x3d2b(v27, v55);
+                                        v71 = 0x3d3c();
+                                        // [ANN] multipliers must be strictly decreasing along the ladder (price-ordered book)
+                                        if (uint64(v67) <= uint64(MEM[MEM[v70] + 32])) {
+                                            v72 = new bytes[](v71.length);
+                                            MCOPY(v72.data, v71.data, v72.length);
+                                            v72[v71.length] = 0;
+                                            revert(Error(v72));
+                                        } else {
+                                            v73 = 0x3d2b(v27, v55);
+                                            v67 = v74 = uint64(MEM[MEM[v73] + 32]);
+                                            v75 = 0x3d2b(v27, v55);
+                                            // [ANN] level price = anchor(v20) * multiplier / 1e6
+                                            v76 = _SafeMul(uint128(v20), uint64(MEM[MEM[v75] + 32]));
+                                            if (v55 - v55) {
+                                                v77 = 0x3d2b(v27, v55);
+                                                v78 = v79 = address(MEM[MEM[v77]]);
+                                            } else {
+                                                v80 = 0x3d2b(v27, v55);
+                                                v78 = v81 = _SafeSub(address(MEM[MEM[v80]]), v29);
+                                            }
+                                            if (varg1 < v78) {
+                                                // [ANN] partial fill of this level: out += remainingIn * price / 1e18, then done
+                                                v82 = _SafeMul(varg1, v76 / 10 ** 6);
+                                                v17 = v83 = _SafeAdd(v17, v82 / 10 ** 18);
+                                                varg1 = v84 = 0;
+                                                break;
+                                            } else {
+                                                // [ANN] full level consumed
+                                                v85 = _SafeMul(v78, v76 / 10 ** 6);
+                                                v17 = _SafeAdd(v17, v85 / 10 ** 18);
+                                                varg1 = _SafeSub(varg1, v78);
+                                                v55 = v55 + 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (varg1) {
+                                    // [ANN] not enough liquidity => output 0 (caller reverts with "T8: Insufficient Liquidity")
+                                    v17 = v86 = 0;
+                                    break;
+                                } else {
+                                    break;
+                                }
+                            }
+                        } else {
+                            v87 = 0x3d2b(v27, v57);
+                            if (MEM[MEM[v87] + 64]) {
+                                v17 = v88 = 0;
+                                break;
+                            } else {
+                                v57 = 0x3cfe(v57);
+                            }
+                        }
+                    }
+                }
+                return v17;
+            }
+        }
+    }
+
+    // [ANN] 0x34e5: FEE CALCULATOR copy used by the exact-out view quote 0x43db5616 (args: side/caller, refBlock). Same as 0x15bb.
+    function 0x34e5(uint256 varg0, uint256 varg1) private {
+        v0 = 0x25cc();
+        // [ANN] AGE fee / expiry
+        v1 = v2 = 0x4494(v0, varg1, uint64(block.number));
+        if (uint32(v2) == uint32.max) {
+            return 1, 0;
+        } else {
+            // [ANN] BASE fee
+            v1 = v3 = stor_5_0_3;
+            v1 = v4 = _poolManager;
+            v5 = v6 = MEM[64];
+            // [ANN] ADDRESS label (caller)
+            v7 = v4.staticcall(0x8547d97200000000000000000000000000000000000000000000000000000000, address(varg0)).gas(msg.gas);
+            require(v7, MEM[64], RETURNDATASIZE());
+            v1 = v8 = 0;
+            if (v7) {
+                v9 = v10 = 14198;
+                if (32 <= RETURNDATASIZE()) {
+                    require(!((v6 + 32 > uint64.max) | (v6 + 32 < v6)), Panic(65)); // failed memory allocation (too much memory)
+                    MEM[64] = v6 + 32;
+                    v11 = v12 = v6 + 32;
+                }
+            }
+            v5 = v13 = MEM[64];
+            // [ANN] ADDRESS label (tx.origin)
+            v14 = v1.staticcall(0x8547d97200000000000000000000000000000000000000000000000000000000, tx.origin).gas(msg.gas);
+            if (!v14) {
+                RETURNDATACOPY(MEM[64], 0, RETURNDATASIZE());
+                revert(MEM[64], RETURNDATASIZE());
+            } else {
+                v1 = v15 = 0;
+                if (v14) {
+                    v1 = v16 = uint16.max;
+                    v9 = v17 = 14158;
+                    v18 = v19 = 32;
+                    if (32 > RETURNDATASIZE()) {
+                        // Unknown jump to Block 0x37550x34e5. Refer to 3-address code (TAC);
+                    }
+                }
+            }
+            v20 = uint16(v1);
+            require(v20 < 4, Panic(33)); // failed convertion to enum type
+            require(uint16(v1) < 4, Panic(33)); // failed convertion to enum type
+            v1 = v21 = 0x521b2;
+            v1 = v22 = 32;
+            v1 = v23 = 0x521d7;
+            v1 = v24 = 0x521fb;
+            v1 = v25 = 4;
+            v1 = v26 = 13870;
+            // [ANN] exempt => default fee waived
+            v27 = v28 = v20 == 1;
+            if (v20 != 1) {
+                v27 = v29 = uint16(v1) == 1;
+            }
+            if (!v27) {
+                v1 = v30 = uint32(_disableTrading >> 160);
+            } else {
+                v1 = v31 = 0;
+            }
+            while (1) {
+                v1 = uint32(v1) + uint32(v1);
+                require(v1 <= uint32.max, Panic(17)); // arithmetic overflow or underflow
+                // Unknown jump to Block ['0x362e0x34e5', '0x36ad0x34e5', '0x521b20x34e5', '0x521d70x34e5', '0x522200x34e5']. Refer to 3-address code (TAC);
+                // [ANN] PRIORITY reference
+                v32 = v1.staticcall(0xeb10127600000000000000000000000000000000000000000000000000000000).gas(msg.gas);
+                if (!v32) {
+                    RETURNDATACOPY(MEM[64], 0, RETURNDATASIZE());
+                    revert(MEM[64], RETURNDATASIZE());
+                } else {
+                    v33 = v34 = 0;
+                    if (v32) {
+                        v35 = v36 = 32;
+                        if (32 > RETURNDATASIZE()) {
+                            v35 = v37 = RETURNDATASIZE();
+                        }
+                        require(!((MEM[64] + (v35 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (MEM[64] + (v35 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+                        require(MEM[64] + v35 - MEM[64] >= 32);
+                    }
+                    v1 = v38 = 0x52220;
+                    v1 = v39 = 0;
+                    v1 = v40 = 13997;
+                    // [ANN] PRIORITY surcharge
+                    v41 = _SafeMul(v33, stor_7_5_8);
+                    v42 = 0x48d5();
+                    if (v39 != v42 > v41 / 10 ** 6) {
+                        v1 = v43 = stor_7_9_12;
+                    }
+                }
+            }
+            if (uint32(v1) > 10 ** 6) {
+                return 0, 10 ** 6;
+            } else {
+                return 0, v1;
+            }
+            // [ANN] ---- address classification tail (same as 0x15bb / 0x2aa6) ----
+            v1 = v44 = _poolManager;
+            v5 = v45 = MEM[64];
+            v46 = address(v1);
+            v47 = v44.staticcall(0x8547d97200000000000000000000000000000000000000000000000000000000, v46).gas(msg.gas);
+            if (!v47) {
+                RETURNDATACOPY(MEM[64], 0, RETURNDATASIZE());
+                revert(MEM[64], RETURNDATASIZE());
+            } else {
+                v1 = v48 = 36;
+                v1 = v49 = 0;
+                if (v47) {
+                    v1 = v50 = 32;
+                    v9 = v51 = 18452;
+                    if (v50 <= RETURNDATASIZE()) {
+                        require(!((v45 + 32 > uint64.max) | (v45 + 32 < v45)), Panic(65)); // failed memory allocation (too much memory)
+                        MEM[64] = v45 + 32;
+                        v11 = v52 = v45 + v50;
+                    }
+                }
+            }
+            require(!((v5 + (v18 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (v5 + (v18 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < v5)), Panic(65)); // failed memory allocation (too much memory)
+            MEM[64] = v5 + (v18 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0);
+            v11 = v53 = v5 + v18;
+            require(v11 - v5 >= 32);
+            v1 = v54 = MEM[v5];
+            require(!(v54 - uint16(v54)));
+            // Unknown jump to Block ['0x374e0x34e5', '0x37760x34e5', '0x47f20x34e5', '0x48140x34e5']. Refer to 3-address code (TAC);
+            // Unknown jump to Block 0x35d40x34e5. Refer to 3-address code (TAC);
+            v55 = uint16(v1);
+            require(v55 < 4, Panic(33)); // failed convertion to enum type
+            v56 = v57 = uint16(v1) >= 4;
+            require(!v57, Panic(33)); // failed convertion to enum type
+            if (stor_7_4_4) {
+                require(!(v55 - 1), AddressNotWhitelisted());
+                v1 = v58 = 0;
+            } else {
+                require(v55 < 4, Panic(33)); // failed convertion to enum type
+                v59 = v60 = v55 == 3;
+                if (v55 != 3) {
+                    v56 = v61 = 0;
+                    v59 = v62 = uint16(v1) == 3;
+                }
+                require(!v59, AddressBlacklisted());
+                v63 = v64 = 2 == v55;
+                if (2 != v55) {
+                    require(!v56, Panic(33)); // failed convertion to enum type
+                    v63 = v65 = 2 == uint16(v1);
+                }
+                if (v63) {
+                    v66 = v67 = 0;
+                    while (v66 < 500) {
+                        v68 = new struct(2);
+                        v69 = v68.data;
+                        v68.word1 = v66;
+                        v68.word0 = 32;
+                        require(!((v68 + 64 > uint64.max) | (v68 + 64 < v68)), Panic(65)); // failed memory allocation (too much memory)
+                        v66 = v66 + 1;
+                    }
+                    v1 = v70 = stor_7_0_3;
+                    // Unknown jump to Block 0x521fb0x34e5. Refer to 3-address code (TAC);
+                } else {
+                    v71 = 0x481b(v1);
+                    if (v71) {
+                        v1 = v72 = stor_7_0_3;
+                        // Unknown jump to Block 0x521fb0x34e5. Refer to 3-address code (TAC);
+                    } else {
+                        v1 = v73 = 0;
+                        // Unknown jump to Block 0x521fb0x34e5. Refer to 3-address code (TAC);
+                    }
+                }
+            }
+            v5 = v74 = MEM[64];
+            v75 = v1.staticcall(0x8547d97200000000000000000000000000000000000000000000000000000000, tx.origin).gas(msg.gas);
+            if (!v75) {
+                RETURNDATACOPY(MEM[64], 0, RETURNDATASIZE());
+                revert(MEM[64], RETURNDATASIZE());
+            } else {
+                v1 = v76 = 0;
+                if (v75) {
+                    v1 = v77 = uint16.max;
+                    v9 = v78 = 18418;
+                    if (32 <= RETURNDATASIZE()) {
+                        require(!((v74 + 32 > uint64.max) | (v74 + 32 < v74)), Panic(65)); // failed memory allocation (too much memory)
+                        MEM[64] = v74 + 32;
+                        v11 = v79 = v74 + 32;
+                    }
+                }
+            }
+            v18 = v80 = RETURNDATASIZE();
+            // Unknown jump to Block 0x373c0x34e5. Refer to 3-address code (TAC);
+        }
+    }
+
+    // [ANN] 0x3786(caller, refBlock, modeFee): FEE CALCULATOR copy used by exact-in swap 0x4c7c47b7. Same logic as 0x15bb/0x2aa6/0x34e5
+    //       but takes the already-computed MODE fee as 3rd arg (varg2) as the starting accumulator (so mode fee is summed with the rest).
+    function 0x3786(uint256 varg0, uint256 varg1, uint256 varg2) private {
+        v0 = 0x25cc();
+        // [ANN] AGE fee / expiry (refBlock = varg1)
+        varg2 = v1 = 0x4494(v0, varg1, uint64(block.number));
+        if (uint32(v1) == uint32.max) {
+            return 1, 0;
+        } else {
+            // [ANN] BASE fee
+            varg2 = v2 = stor_5_0_3;
+            varg2 = v3 = _poolManager;
+            v4 = v5 = MEM[64];
+            // [ANN] ADDRESS label (caller)
+            v6 = v3.staticcall(0x8547d97200000000000000000000000000000000000000000000000000000000, address(varg0)).gas(msg.gas);
+            require(v6, MEM[64], RETURNDATASIZE());
+            varg2 = v7 = 0;
+            if (v6) {
+                v8 = v9 = 14768;
+                if (32 <= RETURNDATASIZE()) {
+                    require(!((v5 + 32 > uint64.max) | (v5 + 32 < v5)), Panic(65)); // failed memory allocation (too much memory)
+                    MEM[64] = v5 + 32;
+                    v10 = v11 = v5 + 32;
+                }
+            }
+            v4 = v12 = MEM[64];
+            // [ANN] ADDRESS label (tx.origin)
+            v13 = varg2.staticcall(0x8547d97200000000000000000000000000000000000000000000000000000000, tx.origin).gas(msg.gas);
+            if (!v13) {
+                RETURNDATACOPY(MEM[64], 0, RETURNDATASIZE());
+                revert(MEM[64], RETURNDATASIZE());
+            } else {
+                varg2 = v14 = 0;
+                if (v13) {
+                    varg2 = v15 = uint16.max;
+                    v8 = v16 = 14735;
+                    if (32 <= RETURNDATASIZE()) {
+                        require(!((v12 + 32 > uint64.max) | (v12 + 32 < v12)), Panic(65)); // failed memory allocation (too much memory)
+                        MEM[64] = v12 + 32;
+                        v10 = v17 = v12 + 32;
+                    }
+                }
+            }
+            v18 = uint16(varg2);
+            require(v18 < 4, Panic(33)); // failed convertion to enum type
+            require(uint16(varg2) < 4, Panic(33)); // failed convertion to enum type
+            varg2 = v19 = 0x522da;
+            varg2 = v20 = 32;
+            varg2 = v21 = 0x522ff;
+            varg2 = v22 = 0x52323;
+            varg2 = v23 = 4;
+            varg2 = v24 = 14520;
+            // [ANN] exempt => waive default fee
+            if (v18 != 1) {
+                if (uint16(varg2) == 1) {
+                    varg2 = v25 = 0;
+                }
+            } else if (v18 == 1) {
+                varg2 = v26 = 0;
+            }
+            // [ANN] DEFAULT fee
+            varg2 = v27 = uint32(_disableTrading >> 160);
+            while (1) {
+                varg2 = uint32(varg2) + uint32(varg2);
+                require(varg2 <= uint32.max, Panic(17)); // arithmetic overflow or underflow
+                // Unknown jump to Block ['0x36ad0x3786', '0x38b80x3786', '0x522da0x3786', '0x522ff0x3786', '0x523480x3786']. Refer to 3-address code (TAC);
+                // [ANN] PRIORITY reference
+                v28 = varg2.staticcall(0xeb10127600000000000000000000000000000000000000000000000000000000).gas(msg.gas);
+                if (!v28) {
+                    RETURNDATACOPY(MEM[64], 0, RETURNDATASIZE());
+                    revert(MEM[64], RETURNDATASIZE());
+                } else {
+                    v29 = v30 = 0;
+                    if (v28) {
+                        v31 = v32 = 32;
+                        if (32 > RETURNDATASIZE()) {
+                            v31 = v33 = RETURNDATASIZE();
+                        }
+                        require(!((MEM[64] + (v31 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (MEM[64] + (v31 + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < MEM[64])), Panic(65)); // failed memory allocation (too much memory)
+                        require(MEM[64] + v31 - MEM[64] >= 32);
+                    }
+                    varg2 = v34 = 13997;
+                    varg2 = v35 = 0x52348;
+                    // [ANN] PRIORITY surcharge: gasprice-basefee > R*stor_7_5_8/1e6 => stor_7_9_12
+                    v36 = _SafeMul(v29, stor_7_5_8);
+                    v37 = 0x48d5();
+                    if (v37 <= v36 / 10 ** 6) {
+                        varg2 = v38 = 0;
+                    } else {
+                        varg2 = v39 = stor_7_9_12;
+                    }
+                }
+            }
+            // [ANN] cap at 100%
+            if (uint32(varg2) > 10 ** 6) {
+                return 0, 10 ** 6;
+            } else {
+                return 0, varg2;
+            }
+            // [ANN] ---- address classification tail (same as 0x15bb) ----
+            varg2 = v40 = _poolManager;
+            v4 = v41 = MEM[64];
+            v42 = address(varg2);
+            v43 = v40.staticcall(0x8547d97200000000000000000000000000000000000000000000000000000000, v42).gas(msg.gas);
+            if (!v43) {
+                RETURNDATACOPY(MEM[64], 0, RETURNDATASIZE());
+                revert(MEM[64], RETURNDATASIZE());
+            } else {
+                varg2 = v44 = 36;
+                varg2 = v45 = 0;
+                if (v43) {
+                    varg2 = v46 = 32;
+                    v8 = v47 = 18452;
+                    if (v46 <= RETURNDATASIZE()) {
+                        require(!((v41 + 32 > uint64.max) | (v41 + 32 < v41)), Panic(65)); // failed memory allocation (too much memory)
+                        MEM[64] = v41 + 32;
+                        v10 = v48 = v41 + v46;
+                    }
+                }
+            }
+            require(!((v4 + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (v4 + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < v4)), Panic(65)); // failed memory allocation (too much memory)
+            MEM[64] = v4 + (RETURNDATASIZE() + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0);
+            v10 = v49 = v4 + RETURNDATASIZE();
+            require(v10 - v4 >= 32);
+            varg2 = v50 = MEM[v4];
+            require(!(v50 - uint16(v50)));
+            // Unknown jump to Block ['0x398f0x3786', '0x39b00x3786', '0x47f20x3786', '0x48140x3786']. Refer to 3-address code (TAC);
+            // Unknown jump to Block 0x38700x3786. Refer to 3-address code (TAC);
+            v51 = uint16(varg2);
+            require(v51 < 4, Panic(33)); // failed convertion to enum type
+            v52 = v53 = uint16(varg2) >= 4;
+            require(!v53, Panic(33)); // failed convertion to enum type
+            if (stor_7_4_4) {
+                require(!(v51 - 1), AddressNotWhitelisted());
+                varg2 = v54 = 0;
+            } else {
+                require(v51 < 4, Panic(33)); // failed convertion to enum type
+                v55 = v56 = v51 == 3;
+                if (v51 != 3) {
+                    v52 = v57 = 0;
+                    v55 = v58 = uint16(varg2) == 3;
+                }
+                require(!v55, AddressBlacklisted());
+                v59 = v60 = 2 == v51;
+                if (2 != v51) {
+                    require(!v52, Panic(33)); // failed convertion to enum type
+                    v59 = v61 = 2 == uint16(varg2);
+                }
+                if (v59) {
+                    v62 = v63 = 0;
+                    while (v62 < 500) {
+                        v64 = new struct(2);
+                        v65 = v64.data;
+                        v64.word1 = v62;
+                        v64.word0 = 32;
+                        require(!((v64 + 64 > uint64.max) | (v64 + 64 < v64)), Panic(65)); // failed memory allocation (too much memory)
+                        v62 = v62 + 1;
+                    }
+                    varg2 = v66 = stor_7_0_3;
+                    // Unknown jump to Block 0x523230x3786. Refer to 3-address code (TAC);
+                } else {
+                    v67 = 0x481b(varg2);
+                    if (v67) {
+                        varg2 = v68 = stor_7_0_3;
+                        // Unknown jump to Block 0x523230x3786. Refer to 3-address code (TAC);
+                    } else {
+                        varg2 = v69 = 0;
+                        // Unknown jump to Block 0x523230x3786. Refer to 3-address code (TAC);
+                    }
+                }
+            }
+            v4 = v70 = MEM[64];
+            v71 = varg2.staticcall(0x8547d97200000000000000000000000000000000000000000000000000000000, tx.origin).gas(msg.gas);
+            if (!v71) {
+                RETURNDATACOPY(MEM[64], 0, RETURNDATASIZE());
+                revert(MEM[64], RETURNDATASIZE());
+            } else {
+                varg2 = v72 = 0;
+                if (v71) {
+                    varg2 = v73 = uint16.max;
+                    v8 = v74 = 18418;
+                    if (32 <= RETURNDATASIZE()) {
+                        require(!((v70 + 32 > uint64.max) | (v70 + 32 < v70)), Panic(65)); // failed memory allocation (too much memory)
+                        MEM[64] = v70 + 32;
+                        v10 = v75 = v70 + 32;
+                    }
+                }
+            }
+        }
+    }
+
+    // [ANN] 0x39c1(side): TOP-OF-BOOK PRICE from the packed quote state stor_0. Returns (ok, price, anchor, refBlock, tag).
+    //       side != 1 (ask-like): price = ceil(anchor * (1e6 + spread) / 1e6)   [the 0xf423f = 999,999 term is the ceil adjustment]
+    //       side == 1 (bid-like): price = floor(anchor * (1e6 - spread) / 1e6)   (if spread >= 1e6 -> returns ok=0 => no quote)
+    //       anchor = uint128(stor_0 >> 80); spread = uint24(stor_0 >> 56) in ppm; refBlock = uint40(stor_0 >> 208); tag = byte(stor_0, 0).
+    //       [PAPER] "a single anchor price p and a single spread s ... Adjusting p and s reprices every level at once"
+    //       (e.g. Fig. 1: p 2,457.460 -> 2,457.788, s 1 -> 45 ppm).
+    function 0x39c1(uint256 varg0) private {
+        require(varg0 < 2, Panic(33)); // failed convertion to enum type
+        if (1 - varg0) {
+            require(10 ** 6 <= 10 ** 6 + uint32(uint24(stor_0 >> 56)), Panic(17)); // arithmetic overflow or underflow
+            v0 = _SafeMul(uint128(stor_0 >> 80), 10 ** 6 + uint32(uint24(stor_0 >> 56)));
+            require(v0 <= v0 + 10 ** 6, Panic(17)); // arithmetic overflow or underflow
+            require(0xf423f + v0 <= v0 + 10 ** 6, Panic(17)); // arithmetic overflow or underflow
+            v1 = v2 = uint128.max;
+            v3 = v4 = (0xf423f + v0) / 10 ** 6;
+            v5 = 0x2b7a();
+            if (v4 > v2) {
+                v6 = new bytes[](v5.length);
+                MCOPY(v6.data, v5.data, v6.length);
+                v6[v5.length] = 0;
+                revert(Error(v6));
+            }
+        } else if (uint32(uint24(stor_0 >> 56)) >= 10 ** 6) {
+            return 0, 0, uint128(stor_0 >> 80), uint40(stor_0 >> 208), byte(stor_0, 0x0);
+        } else {
+            v7 = 0x2c2c(uint32(uint24(stor_0 >> 56)));
+            v8 = _SafeMul(uint128(stor_0 >> 80), v7);
+            v3 = v9 = v8 / 10 ** 6;
+        }
+        return 1, uint128(v3), uint128(stor_0 >> 80), uint40(stor_0 >> 208), byte(stor_0, 0x0);
+    }
+
+    // [ANN] 0x3aee(n) = 10**n (n <= 77)
+    function 0x3aee(uint8 varg0) private {
+        require(varg0 <= 77, Panic(17)); // arithmetic overflow or underflow
+        return 10 ** varg0;
+    }
+
+    // [ANN] 0x3aff(x): scale x between the two tokens' decimals in one direction (base->quote); uint128 overflow-checked.
+    function 0x3aff(uint256 varg0) private {
+        if (stor_31_20_20 == stor_31_21_21) {
+            return varg0;
+        } else if (stor_31_20_20 <= stor_31_21_21) {
+            v0 = 0x3175(stor_31_21_21, stor_31_20_20);
+            v1 = 0x3aee(v0);
+            v2 = _SafeMul(uint128(varg0), v1);
+            v3 = 0x2b7a();
+            if (v2 > uint128.max) {
+                v4 = new bytes[](v3.length);
+                MCOPY(v4.data, v3.data, v4.length);
+                v4[v3.length] = 0;
+                revert(Error(v4));
+            } else {
+                return uint128(v2);
+            }
+        } else {
+            v5 = 0x3175(stor_31_20_20, stor_31_21_21);
+            v6 = 0x3aee(v5);
+            v7 = _SafeDiv(uint128(varg0), v6);
+            v8 = 0x2b7a();
+            if (v7 > uint128.max) {
+                v9 = new bytes[](v8.length);
+                MCOPY(v9.data, v8.data, v9.length);
+                v9[v8.length] = 0;
+                revert(Error(v9));
+            } else {
+                return uint128(v7);
+            }
+        }
+    }
+
+    // [ANN] 0x3b89(x): decimals scaling in the opposite direction (quote->base)
+    function 0x3b89(uint256 varg0) private {
+        if (stor_31_20_20 == stor_31_21_21) {
+            return varg0;
+        } else if (stor_31_21_21 <= stor_31_20_20) {
+            v0 = 0x3175(stor_31_20_20, stor_31_21_21);
+            v1 = 0x3aee(v0);
+            v2 = _SafeMul(uint128(varg0), v1);
+            v3 = 0x2b7a();
+            if (v2 > uint128.max) {
+                v4 = new bytes[](v3.length);
+                MCOPY(v4.data, v3.data, v4.length);
+                v4[v3.length] = 0;
+                revert(Error(v4));
+            } else {
+                return uint128(v2);
+            }
+        } else {
+            v5 = 0x3175(stor_31_21_21, stor_31_20_20);
+            v6 = 0x3aee(v5);
+            v7 = _SafeDiv(uint128(varg0), v6);
+            v8 = 0x2b7a();
+            if (v7 > uint128.max) {
+                v9 = new bytes[](v8.length);
+                MCOPY(v9.data, v8.data, v9.length);
+                v9[v8.length] = 0;
+                revert(Error(v9));
+            } else {
+                return uint128(v7);
+            }
+        }
+    }
+
+    // [ANN] 0x3bcc(p) = 1e36 / p, saturating at uint128.max: PRICE INVERSION (quote/base <-> base/quote); 0 stays 0.
+    function 0x3bcc(uint128 varg0) private {
+        if (!varg0) {
+            return 0;
+        } else {
+            require(varg0, Panic(18)); // division by zero
+            if (10 ** 36 / varg0 > uint128.max) {
+                return uint128.max;
+            } else {
+                return uint128(10 ** 36 / varg0);
+            }
+        }
+    }
+
+    // [ANN] 0x3c41(x, fee) = ceil(x * 1e6 / (1e6 - fee)): gross-up for exact-out. Returns uint256.max if fee >= 100% or x too large.
+    function 0x3c41(uint256 varg0, uint32 varg1) private {
+        if (varg1 < 10 ** 6) {
+            if (varg0 < 0x10c6f7a0b5ed8d36b4c7f34938583621fafc8b0079a2834d26fa3fcc9ea9) {
+                v0 = 0x2c2c(varg1);
+                require(!varg0 | (10 ** 6 == varg0 * 10 ** 6 / varg0), Panic(17)); // arithmetic overflow or underflow
+                v1 = _SafeAdd(varg0 * 10 ** 6, v0);
+                require(v1 - 1 <= v1, Panic(17)); // arithmetic overflow or underflow
+                v2 = _SafeDiv(v1 - 1, v0);
+                return v2;
+            }
+        }
+        return uint256.max;
+    }
+
+    function 0x3cfe(uint256 varg0) private {
+        require(varg0 != uint256.max, Panic(17)); // arithmetic overflow or underflow
+        return 1 + varg0;
+    }
+
+    // [ANN] 0x3d2b(arr, i): bounds-checked address of element i (i < 20) in an in-memory Order[20] pointer array
+    function 0x3d2b(uint256 varg0, uint256 varg1) private {
+        require(varg1 < 20, Panic(50)); // access an out-of-bounds or negative index of bytesN array or slice
+        return (varg1 << 5) + varg0;
+    }
+
+    function 0x3d3c() private {
+        require(!0, Panic(65)); // failed memory allocation (too much memory)
+        return 0x543336;
+    }
+
+    // [ANN] 0x409c: OZ ReentrancyGuard acquire
+    function 0x409c() private {
+        require(stor_9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00 != 2, ReentrancyGuardReentrantCall());
+        stor_9b779b17422d0df92223018b32b4d1fa46e071723d6817e2486d003becc55f00 = 2;
+        return ;
+    }
+
+    // [ANN] 0x4120(mode) = MODE FEE. If the mode helper (stor_34) is unset => 0. Else staticcall helper.0x4a89bec0(uint8 mode)
+    //       -> uint ppm fee, clamped to [0, 1e6]. [PAPER] "mode" fee component (lowest-mass component, thinnest informative tail in Fig. 10).
+    function 0x4120(uint8 varg0) private {
+        if (!stor_34_0_19) {
+            return 0;
+        } else {
+            v0 = new bytes[](36);
+            MEM[v0.data] = 0x4a89bec000000000000000000000000000000000000000000000000000000000;
+            MEM[v0 + 36] = varg0;
+            require(!((v0 + 96 > uint64.max) | (v0 + 96 < v0)), Panic(65)); // failed memory allocation (too much memory)
+            v1 = v0.length;
+            v2 = v3, /* uint256 */ v4 = stor_34_0_19.staticcall(0x4a89bec000000000000000000000000000000000000000000000000000000000, varg0).gas(msg.gas);
+            if (!RETURNDATASIZE()) {
+                v5 = v6 = 96;
+            } else {
+                require(RETURNDATASIZE() <= uint64.max, Panic(65)); // failed memory allocation (too much memory)
+                v5 = v7 = new bytes[](RETURNDATASIZE());
+                require(!((v7 + (32 + (0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0 & RETURNDATASIZE() + 31) + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (v7 + (32 + (0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0 & RETURNDATASIZE() + 31) + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < v7)), Panic(65)); // failed memory allocation (too much memory)
+                v4 = v7.data;
+                RETURNDATACOPY(v4, 0, RETURNDATASIZE());
+            }
+            if (v3) {
+                v2 = v8 = MEM[v5] >= 32;
+            }
+            if (v2) {
+                require(v5 + MEM[v5] - v5 >= 32);
+                if (MEM[32 + v5] <= 0) {
+                    return 0;
+                } else if (MEM[32 + v5] >= 10 ** 6) {
+                    return 10 ** 6;
+                } else {
+                    return uint32(MEM[32 + v5]);
+                }
+            } else {
+                return 0;
+            }
+        }
+    }
+
+    // [ANN] 0x41e3: PURE GAS BURNER. 1000 iterations of a 2-word memory allocation, no observable effect. Called at the end of every swap.
+    //       Presumably deliberate: raises swap gas cost (paper: 201k-402k) relative to updates (~27k), cf. the paper's remark that
+    //       updates are 5-15x cheaper than swaps. Also a plausible anti-spam / priority-fee-shaping tool (cost is on the taker only).
+    function 0x41e3() private {
+        v0 = v1 = 0;
+        while (v0 < 1000) {
+            v2 = new struct(2);
+            v3 = v2.data;
+            v2.word1 = v0;
+            v2.word0 = 32;
+            require(!((v2 + 64 > uint64.max) | (v2 + 64 < v2)), Panic(65)); // failed memory allocation (too much memory)
+            v0 = v0 + 1;
+        }
+        return ;
+    }
+
+    function 0x4455(uint64 varg0, uint64 varg1) private {
+        require(varg0 - varg1 <= uint64.max, Panic(17)); // arithmetic overflow or underflow
+        return varg0 - varg1;
+    }
+
+    function 0x4477(uint32 varg0, uint32 varg1) private {
+        require(!(uint32(varg0 * varg1) - varg0 * varg1), Panic(17)); // arithmetic overflow or underflow
+        return uint32(varg0 * varg1);
+    }
+
+    // [ANN] 0x4494(params, refBlock, currentBlock): AGE FEE / QUOTE EXPIRY.
+    //       age = currentBlock - refBlock (if currentBlock < refBlock -> returns uint32.max = invalid).
+    //       params.word0 = expiry age: age >= expiry            -> uint32.max (NO FILL)
+    //       params.word1 = grace:      age <  grace             -> 0 (no penalty)
+    //       else n = age - grace + 1; fee = coef * n * n (uint32, overflow-guarded), capped at params.word3 (cap), saturating to cap on overflow.
+    //       [PAPER] "no freshness penalty for a short grace period, an increasingly worse price thereafter, and no fill at all once the quote expires."
+    //       NB: Dedaub merged the two mulitplications; real shape = quadratic in age.
+    function 0x4494(struct(4) varg0, uint256 varg1, uint256 varg2) private {
+        if (uint64(varg2) >= uint64(varg1)) {
+            v0 = 0x4455(varg2, varg1);
+            if (uint64(v0) < uint64(varg0.word0)) {
+                if (uint64(v0) < uint64(varg0.word1)) {
+                    return 0;
+                } else {
+                    v1 = 0x4455(v0, uint64(varg0.word1));
+                    require(uint64(v1) + 1 <= uint64.max, Panic(17)); // arithmetic overflow or underflow
+                    if (uint64(uint64(v1) + 1) > uint32.max) {
+                        return uint32(varg0.word3);
+                    } else {
+                        require(uint32(uint64(v1) + 1), Panic(18)); // division by zero
+                        if (uint32(varg0.word2) > uint32(uint32.max / uint32(uint64(v1) + 1))) {
+                            return uint32(varg0.word3);
+                        } else {
+                            v2 = 0x4477(uint32(varg0.word2), uint32(uint64(v1) + 1));
+                            if (uint32(v2) > uint32(uint32.max / uint32(uint64(v1) + 1))) {
+                                return uint32(varg0.word3);
+                            } else {
+                                v3 = 0x4477(v2, uint32(uint64(v1) + 1));
+                                if (0 == uint32(v3) < uint32(varg0.word3)) {
+                                    return uint32(varg0.word3);
+                                } else {
+                                    return v3;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return uint32.max;
+    }
+
+    // [ANN] 0x481b(caller): FINGERPRINT HELPER CALL. If stor_33 is unset => false. Else staticcall stor_33.0x1ed58fc8(tx.origin, caller) -> bool.
+    //       True => the ADDRESS fee (stor_7_0_3) is charged. [PAPER] Appendix C.2: helper "0xfdb...684" fingerprints observable address/code
+    //       features (coffee-prefixed origins, 30-byte forwarding contracts, Metric callbacks) without storing a label.
+    //       => TO DO: read stor_33's runtime code (getter 0x3c0ae986 on the pool) to see the exact patterns.
+    function 0x481b(address varg0) private {
+        if (!stor_33_0_19) {
+            return 0;
+        } else {
+            v0 = new bytes[](68);
+            MEM[v0.data] = 0x1ed58fc800000000000000000000000000000000000000000000000000000000;
+            MEM[v0 + 36] = tx.origin;
+            MEM[v0 + 68] = varg0;
+            require(!((v0 + 128 > uint64.max) | (v0 + 128 < v0)), Panic(65)); // failed memory allocation (too much memory)
+            v1 = v0.length;
+            v2 = v3, /* uint256 */ v4 = stor_33_0_19.staticcall(0x1ed58fc800000000000000000000000000000000000000000000000000000000, tx.origin, varg0).gas(msg.gas);
+            if (!RETURNDATASIZE()) {
+                v5 = v6 = 96;
+            } else {
+                require(RETURNDATASIZE() <= uint64.max, Panic(65)); // failed memory allocation (too much memory)
+                v5 = v7 = new bytes[](RETURNDATASIZE());
+                require(!((v7 + (32 + (0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0 & RETURNDATASIZE() + 31) + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (v7 + (32 + (0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0 & RETURNDATASIZE() + 31) + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < v7)), Panic(65)); // failed memory allocation (too much memory)
+                v4 = v7.data;
+                RETURNDATACOPY(v4, 0, RETURNDATASIZE());
+            }
+            if (v3) {
+                v2 = v8 = MEM[v5] >= 32;
+            }
+            if (v2) {
+                require(v5 + MEM[v5] + 32 - (v5 + 32) >= 32);
+                require(!(MEM[v5 + 32] - bool(MEM[v5 + 32])));
+                return MEM[v5 + 32];
+            } else {
+                return 0;
+            }
+        }
+    }
+
+    // [ANN] 0x48d5: EFFECTIVE PRIORITY FEE = max(tx.gasprice - block.basefee, 0). Input to the PRIORITY fee component.
+    //       [PAPER] "Recall that Tessera charges an additional penalty on trades paying a high priority fee ... to protect against trades
+    //       that try to execute ahead of its repricing at the start of the block."
+    function 0x48d5() private {
+        if (tx.gasprice < BASEFEE()) {
+            return 0;
+        } else {
+            v0 = _SafeSub(tx.gasprice, BASEFEE());
+            return v0;
+        }
+    }
+
+    function baseToken() public nonPayable {
+        require(msg.data.length - 4 >= 0);
+        return _baseToken;
+    }
+
+    // [ANN] getter: raw packed quote state stor_0 (tag | refBlock | anchor | spread). Off-chain indexers decode p and s from this.
+    function 0xa9977bfe() public nonPayable {
+        require(msg.data.length - 4 >= 0);
+        return stor_0;
+    }
+
+    function isInitialised() public nonPayable {
+        require(msg.data.length - 4 >= 0);
+        return _isInitialised;
+    }
+
+    // [ANN] WITHDRAW NATIVE ETH: only _multiSigOwner.
+    function 0x8f05e71b(uint256 varg0, address varg1) public nonPayable {
+        require(msg.data.length - 4 >= 64);
+        v0 = 0x2ae4();
+        if (msg.sender != _multiSigOwner) {
+            v1 = new bytes[](v0.length);
+            MCOPY(v1.data, v0.data, v1.length);
+            v1[v0.length] = 0;
+            revert(Error(v1));
+        } else {
+            v2, /* uint256 */ v3 = varg1.call().value(varg0).gas(msg.gas);
+            if (RETURNDATASIZE()) {
+                require(RETURNDATASIZE() <= uint64.max, Panic(65)); // failed memory allocation (too much memory)
+                v4 = v5 = new bytes[](RETURNDATASIZE());
+                require(!((v5 + (32 + (0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0 & RETURNDATASIZE() + 31) + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) > uint64.max) | (v5 + (32 + (0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0 & RETURNDATASIZE() + 31) + 31 & 0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe0) < v5)), Panic(65)); // failed memory allocation (too much memory)
+                v3 = v5.data;
+                RETURNDATACOPY(v3, 0, RETURNDATASIZE());
+            }
+            require(!0, Panic(65)); // failed memory allocation (too much memory)
+            if (!v2) {
+                MEM[MEM[64]] = 0x8c379a000000000000000000000000000000000000000000000000000000000;
+                v6 = new bytes[](v7.length);
+                MCOPY(v6.data, v7.data, v6.length);
+                v6[v7.length] = 0;
+                revert(Error(v6));
+            } else {
+                exit;
+            }
+        }
+    }
+
+    function enableTrading() public nonPayable {
+        require(msg.data.length - 4 >= 0);
+        v0 = v1 = msg.sender == address(_disableTrading);
+        if (msg.sender != address(_disableTrading)) {
+            v0 = v2 = msg.sender == _poolManager;
+        }
+        v3 = 0x2778();
+        if (!v0) {
+            v4 = new bytes[](v3.length);
+            MCOPY(v4.data, v3.data, v4.length);
+            v4[v3.length] = 0;
+            revert(Error(v4));
+        } else {
+            _tradingEnabled = 1;
+            exit;
+        }
+    }
+
+    // [ANN] SET MODE-FEE HELPER (operator only): stor_34 = helper address (see 0x4120). getter: 0x7af3c3d6.
+    function 0x7bcffd54(address varg0) public nonPayable {
+        require(msg.data.length - 4 >= 32);
+        v0 = 0x3089();
+        if (msg.sender != address(_disableTrading)) {
+            v1 = new bytes[](v0.length);
+            MCOPY(v1.data, v0.data, v1.length);
+            v1[v0.length] = 0;
+            revert(Error(v1));
+        } else {
+            stor_34_0_19 = varg0;
+            return ;
+        }
+    }
+
+    function 0x7af3c3d6() public nonPayable {
+        require(msg.data.length - 4 >= 0);
+        // [ANN] getter: MODE-FEE helper address (stor_34)
+        return stor_34_0_19;
+    }
+
+    function 0x760f6a4c() public nonPayable {
+        require(msg.data.length - 4 >= 0);
+        // [ANN] getter: current DEFAULT fee in ppm (bits 160..191 of slot 0x32). The operator flips this per block via 0x1667d875.
+        return uint32(_disableTrading >> 160);
+    }
+
+    // [ANN] FEE/PARAMETER CONFIG (operator only). Writes slots 5, 6, 7 and the fingerprint helper (stor_33, last arg).
+    //       Dedaub's argument order is shifted relative to the storage writes; follow the writes:
+    //         stor_5_0_3 = base fee (<= 1e6), stor_5_4_7 = accumulator factor (<= 1e6), stor_5_8_8 = #excluded levels, stor_5_9_9 = netting flag,
+    //         slot 6 = age params {expiry, grace, coef, cap(<=1e6)}, slot 7 = {address fee, whitelist-only, priority multiplier, priority fee},
+    //         stor_33 = fingerprint helper address (varg12, address-typed).
+    //       This is the "withhold-share" knob set: all fee components except DEFAULT (flipped separately via 0x1667d875).
+    function 0x75e8422f(uint32 varg0, uint32 varg1, uint32 varg2, uint32 varg3, uint8 varg4, bool varg5, uint64 varg6, uint64 varg7, uint32 varg8, uint32 varg9, uint32 varg10, uint32 varg11, bool varg12) public nonPayable {
+        require(msg.data.length - 4 >= 416);
+        v0 = 0x3089();
+        if (msg.sender != address(_disableTrading)) {
+            v1 = new bytes[](v0.length);
+            MCOPY(v1.data, v0.data, v1.length);
+            v1[v0.length] = 0;
+            revert(Error(v1));
+        } else {
+            v2 = 0x298d();
+            if (varg0 > 10 ** 6) {
+                v3 = new bytes[](v2.length);
+                MCOPY(v3.data, v2.data, v3.length);
+                v3[v2.length] = 0;
+                revert(Error(v3));
+            } else {
+                require(!(varg7 - uint32(varg7)));
+                v4 = 0x298d();
+                if (uint32(varg7) > 10 ** 6) {
+                    v5 = new bytes[](v4.length);
+                    MCOPY(v5.data, v4.data, v5.length);
+                    v5[v4.length] = 0;
+                    revert(Error(v5));
+                } else {
+                    v6 = 0x29c8();
+                    if (varg1 > 10 ** 6) {
+                        v7 = new bytes[](v6.length);
+                        MCOPY(v7.data, v6.data, v7.length);
+                        v7[v6.length] = 0;
+                        revert(Error(v7));
+                    } else {
+                        require(!(varg2 - uint8(varg2)));
+                        require(!(varg3 - bool(varg3)));
+                        // [ANN] BASE fee, accumulator factor, excluded-level count, netting flag
+                        stor_5_0_3 = varg0;
+                        stor_5_4_7 = varg1;
+                        stor_5_8_8 = varg2;
+                        stor_5_9_9 = bool(varg3);
+                        require(!(varg4 - uint64(varg4)));
+                        require(!(varg5 - uint64(varg5)));
+                        require(!(varg6 - uint32(varg6)));
+                        // [ANN] AGE params (expiry, grace, coef, cap)
+                        stor_6_0_7 = varg4;
+                        stor_6_16_19 = varg6;
+                        stor_6_8_15 = varg5;
+                        require(!(varg7 - uint32(varg7)));
+                        stor_6_20_23 = varg7;
+                        require(!(varg9 - bool(varg9)));
+                        // [ANN] ADDRESS fee, whitelist-only flag, PRIORITY multiplier and fee
+                        stor_7_0_3 = varg8;
+                        stor_7_4_4 = bool(varg9);
+                        stor_7_5_8 = varg10;
+                        stor_7_9_12 = varg11;
+                        require(!(varg12 - address(varg12)));
+                        // [ANN] FINGERPRINT HELPER address
+                        stor_33_0_19 = varg12;
+                        return ;
+                    }
+                }
+            }
+        }
+    }
+
+    // [ANN] INITIALISER (one-shot): (multisig, poolManager, operator, baseToken, quoteToken, baseDecimals, quoteDecimals).
+    //       Operator goes into the low 160 bits of slot 0x32 (the upper bits hold the DEFAULT fee, initially 0).
+    function 0x67107049(address varg0, address varg1, address varg2, address varg3, address varg4, uint8 varg5, uint8 varg6) public nonPayable {
+        require(msg.data.length - 4 >= 224);
+        require(!0, Panic(65)); // failed memory allocation (too much memory)
+        if (_isInitialised) {
+            v0 = new bytes[](v1.length);
+            MCOPY(v0.data, v1.data, v0.length);
+            v0[v1.length] = 0;
+            revert(Error(v0));
+        } else {
+            _poolManager = varg1;
+            _baseToken = varg3;
+            _quoteToken = varg4;
+            stor_31_20_20 = varg5;
+            stor_31_21_21 = varg6;
+            _disableTrading = bytes12(_disableTrading) | varg2;
+            _tradingEnabled = 1;
+            _isInitialised = 1;
+            _multiSigOwner = varg0;
+            return ;
+        }
+    }
+
+    // [ANN] poolState(): full public snapshot used by indexers: both accumulators, fee/age/priority params, both ladders.
+    function poolState() public nonPayable {
+        require(msg.data.length - 4 >= 0);
+        v0 = 0x25cc();
+        v1 = new struct(2);
+        require(!((v1 + 64 > uint64.max) | (v1 + 64 < v1)), Panic(65)); // failed memory allocation (too much memory)
+        v2 = 0x2629();
+        v1.word0 = v2;
+        v3 = 0x26a2();
+        v1.word1 = v3;
+        0x271b(v1.word0, MEM[64] + 448);
+        0x271b(v1.word1, MEM[64] + 2368);
+        return _poolState, stor_4, stor_5_0_3, stor_5_4_7, stor_5_8_8, stor_5_9_9, uint64(v0.word0), uint64(v0.word1), uint32(v0.word2), uint32(v0.word3), stor_7_0_3, stor_7_4_4, stor_7_5_8, stor_7_9_12;
+    }
+
+    // Note: The function selector is not present in the original solidity code.
+    // However, we display it for the sake of completeness.
+
+    // [ANN] SELECTOR TABLE. IMPORTANT: there is NO dispatch entry for the cheap anchor/spread update (~27k gas). In the paper this
+    //       is the hot path (p,s update every ~0.56 blocks). It must therefore be handled BEFORE this dispatcher, e.g. a raw-calldata
+    //       fast path keyed on the operator caller / calldata length, which Dedaub did not lift. The write target is stor_0.
+    //       => Trace one real update tx (operator -> pool) to recover the calldata layout.
+    function __function_selector__( function_selector) public payable {
+        MEM[64] = 128;
+        if (msg.data.length >= 4) {
+            if (0x329dd62 == function_selector >> 224) {
+                multiSigOwner();
+            } else if (0x1667d875 == function_selector >> 224) {
+                0x1667d875();
+            } else if (0x17700f01 == function_selector >> 224) {
+                disableTrading();
+            } else if (0x209dab1e == function_selector >> 224) {
+                0x209dab1e();
+            } else if (0x21523c7e == function_selector >> 224) {
+                0x21523c7e();
+            } else if (0x217a4b70 == function_selector >> 224) {
+                quoteToken();
+            } else if (0x2c88026b == function_selector >> 224) {
+                0x2c88026b();
+            } else if (0x3c0ae986 == function_selector >> 224) {
+                0x3c0ae986();
+            } else if (0x3d253f20 == function_selector >> 224) {
+                0x3d253f20();
+            } else if (0x43db5616 == function_selector >> 224) {
+                0x43db5616();
+            } else if (0x4a036fcb == function_selector >> 224) {
+                0x4a036fcb();
+            } else if (0x4ada218b == function_selector >> 224) {
+                tradingEnabled();
+            } else if (0x4c7c47b7 == function_selector >> 224) {
+                0x4c7c47b7();
+            } else if (0x5b7e30e5 == function_selector >> 224) {
+                0x5b7e30e5();
+            } else if (0x641ad8a9 == function_selector >> 224) {
+                poolState();
+            } else if (0x67107049 == function_selector >> 224) {
+                0x67107049();
+            } else if (0x75e8422f == function_selector >> 224) {
+                0x75e8422f();
+            } else if (0x760f6a4c == function_selector >> 224) {
+                0x760f6a4c();
+            } else if (0x7af3c3d6 == function_selector >> 224) {
+                0x7af3c3d6();
+            } else if (0x7bcffd54 == function_selector >> 224) {
+                0x7bcffd54();
+            } else if (0x8a8c523c == function_selector >> 224) {
+                enableTrading();
+            } else if (0x8f05e71b == function_selector >> 224) {
+                0x8f05e71b();
+            } else if (0x9ed3c90c == function_selector >> 224) {
+                isInitialised();
+            } else if (0xa9977bfe == function_selector >> 224) {
+                0xa9977bfe();
+            } else if (0xc55dae63 == function_selector >> 224) {
+                baseToken();
+            } else if (0xdba310cf == function_selector >> 224) {
+                0xdba310cf();
+            } else if (0xdc4c90d3 == function_selector >> 224) {
+                poolManager();
+            } else if (0xece42d7f == function_selector >> 224) {
+                0xece42d7f();
+            } else {
+                exit;
+            }
+        } else {
+            // [ANN] calldata < 4 bytes => exit (no revert, no fallback). The raw update fast-path is probably elsewhere (see above).
+            exit;
+        }
+    }
+}
