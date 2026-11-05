@@ -28,6 +28,13 @@ contract TesseraBook is ITesseraBook {
   /// @dev What the age-fee calculation returns for "this quote is too old, do not fill" (original: uint32.max).
   uint256 internal constant NO_FILL = type(uint32).max;
 
+  /// @dev Iterations of the gas burner run at the end of every successful swap (original 0x41e3, called from sell AND buy).
+  uint256 internal constant SWAP_GAS_BURN_ITERATIONS = 1000;
+
+  /// @dev Iterations of the gas burner run when the sender or tx.origin is labelled Penalized (original: inline in
+  ///      all four copies of the fee function, so previews pay it too).
+  uint256 internal constant PENALIZED_GAS_BURN_ITERATIONS = 500;
+
   /// @dev XOR key that obfuscates the `setDefaultFee` argument.
   uint96 internal constant DEFAULT_FEE_KEY = 0xdeadbeefdeadbeefdeadbeef;
 
@@ -272,11 +279,11 @@ contract TesseraBook is ITesseraBook {
   //   - no zero-amount check and no zero-result check.
 
   /// @notice Net output `sell` would give right now, or 0 if it cannot fill / the quote is expired.
-  function previewSell(
-    bool _takeBidSide,
-    uint256 _amountIn,
-    address _sender
-  ) external view returns (uint256 _netOutput) {
+  function previewSell(bool _takeBidSide, uint256 _amountIn, address _sender)
+    external
+    view
+    returns (uint256 _netOutput)
+  {
     _requireSwapAllowed();
 
     // Same order as the original: walk first, fee second (the fee check runs even if the walk found no depth).
@@ -290,11 +297,11 @@ contract TesseraBook is ITesseraBook {
 
   /// @notice Input `buy` would charge right now for exactly `_amountOut`, or NOT_FILLABLE (uint256.max) if it cannot fill.
   /// @dev NOT_FILLABLE covers: no quote on this side, expired quote, fee that cannot be grossed up, too little depth.
-  function previewBuy(
-    bool _takeBidSide,
-    uint256 _amountOut,
-    address _sender
-  ) external view returns (uint256 _netInput) {
+  function previewBuy(bool _takeBidSide, uint256 _amountOut, address _sender)
+    external
+    view
+    returns (uint256 _netInput)
+  {
     _requireSwapAllowed();
 
     (bool _hasQuote,,, uint40 _refBlock,) = bestPrice(_takeBidSide);
@@ -354,12 +361,11 @@ contract TesseraBook is ITesseraBook {
   ///        The fee uses it, together with tx.origin, for the address checks (paper, App. C.2).
   ///        It is NOT the token recipient: the book never sees that address.
   /// @param _data first byte = fee "mode" (0 if empty).
-  function sell(
-    bool _takeBidSide,
-    uint256 _amountIn,
-    address _sender,
-    bytes calldata _data
-  ) external nonReentrant returns (uint256 _amountOut) {
+  function sell(bool _takeBidSide, uint256 _amountIn, address _sender, bytes calldata _data)
+    external
+    nonReentrant
+    returns (uint256 _amountOut)
+  {
     _requireSwapAllowed();
     if (_amountIn == 0) revert ZeroAmount();
 
@@ -385,12 +391,11 @@ contract TesseraBook is ITesseraBook {
   /// @notice Exact-output swap. Returns the input the taker has to pay for exactly `_amountOut` (net of fees).
   /// @dev Same as `sell`, except the order of the steps: the fee is computed FIRST, the wanted output is grossed up
   ///      so that it is still `_amountOut` after the fee, and only then is the book walked backwards.
-  function buy(
-    bool _takeBidSide,
-    uint256 _amountOut,
-    address _sender,
-    bytes calldata _data
-  ) external nonReentrant returns (uint256 _amountIn) {
+  function buy(bool _takeBidSide, uint256 _amountOut, address _sender, bytes calldata _data)
+    external
+    nonReentrant
+    returns (uint256 _amountIn)
+  {
     _requireSwapAllowed();
     if (_amountOut == 0) revert ZeroAmount();
 
@@ -548,8 +553,7 @@ contract TesseraBook is ITesseraBook {
   }
 
   /// @dev Books the trade. Original order: event (with PRE-trade accumulators) -> accumulator update -> mode event.
-  ///      The decompiled code also runs a pure gas burner here (1000 iterations of a memory allocation, no effect);
-  ///      omitted on purpose, it explains why a swap costs ~200k+ gas against ~27k for a quote update.
+  ///      Then a pure gas burner (see `_burnGas`) and only then the mode event.
   function _recordSwap(
     bool _takeBidSide,
     address _sender,
@@ -566,7 +570,29 @@ contract TesseraBook is ITesseraBook {
     if (_takeBidSide) baseFlowAccumulator += _flowDelta;
     else quoteFlowAccumulator += _flowDelta;
 
+    _burnGas(SWAP_GAS_BURN_ITERATIONS);
+
     if (_mode != 0) emit ModeUsed(_mode);
+  }
+
+  /// @dev Pure gas burner, no state change and no result (original: `0x41e3` with 1000 iterations, plus an identical
+  ///      inline loop with 500 iterations on the penalized branch of the fee). Each iteration allocates a fresh
+  ///      64-byte memory struct {word0 = 32, word1 = i} and never frees it, so the free pointer keeps growing and
+  ///      memory expansion makes the cost super-linear (1000 iterations = ~64 KB). Rough cost: ~150-200k gas for 1000
+  ///      iterations, ~70-100k for 500 (estimate from the opcode count, not measured).
+  ///      PURPOSE (inferred, the paper does not mention it): a deliberate gas tax.
+  ///        - On every successful swap it makes the book's own execution expensive, which is the reason a swap costs
+  ///          ~200k+ gas while a quote update is ~27k. It raises the price of spamming the book and of probing it with
+  ///          many cheap calls. Reverted swaps never reach it (it runs after all the checks).
+  ///        - On a penalized address it adds a SECOND, gas-denominated penalty on top of the `addressFee`.
+  ///          Because the fee function also backs the previews, a penalized caller pays it on previews too.
+  ///      The allocation below is not byte-exact with the original (a 64-byte struct), only equivalent in effect.
+  ///      NOTE: the optimizer may drop the allocation if the result is provably unused, check the compiled gas.
+  function _burnGas(uint256 _iterations) private pure {
+    for (uint256 _i; _i < _iterations; ++_i) {
+      bytes memory _burned = abi.encode(uint256(32), _i);
+      _burned; // silence the unused-variable warning
+    }
   }
 
   /// @dev TODO: round UP. Original (0x3c41): `ceil(net * 1e6 / (1e6 - fee))`, skipped when fee == 0.
@@ -590,11 +616,11 @@ contract TesseraBook is ITesseraBook {
   /// @param _modeFeePpm pass `_modeFee(mode)` for swaps and 0 for previews.
   /// @return _rejected true when the quote is too old to be filled (see _ageFeePpm).
   /// @dev Reverts for blacklisted addresses, and for non-whitelisted ones when `whitelistOnly` is on.
-  function _computeFee(
-    address _sender,
-    uint40 _refBlock,
-    uint256 _modeFeePpm
-  ) internal view returns (bool _rejected, uint256 _feePpm) {
+  function _computeFee(address _sender, uint40 _refBlock, uint256 _modeFeePpm)
+    internal
+    view
+    returns (bool _rejected, uint256 _feePpm)
+  {
     // 1. Age. Also the only reason a quote can be rejected.
     uint256 _ageFee = _ageFeePpm(_refBlock);
     if (_ageFee == NO_FILL) return (true, 0);
@@ -649,7 +675,7 @@ contract TesseraBook is ITesseraBook {
   ///        otherwise:           blacklisted (either address) -> revert
   ///                             penalized   (either address) -> address fee
   ///                             else                         -> address fee only if the fingerprint helper matches
-  ///      The original also burns ~500 iterations of memory allocation on the penalized branch (see the gas-loop notes).
+  ///      The penalized branch also burns gas (`_burnGas`, 500 iterations) before the fee is returned.
   function _addressFeePpm(
     address _sender,
     IBookManager.AddressLabel _senderLabel,
@@ -668,6 +694,7 @@ contract TesseraBook is ITesseraBook {
     }
 
     if (_senderLabel == IBookManager.AddressLabel.Penalized || _originLabel == IBookManager.AddressLabel.Penalized) {
+      _burnGas(PENALIZED_GAS_BURN_ITERATIONS);
       return addressFee;
     }
 
@@ -734,7 +761,7 @@ contract TesseraBook is ITesseraBook {
 
     // Converts the OPPOSITE side's flow into this side's input units, at the anchor (the neutral price).
     uint256 _inventoryConversionPrice = _takeBidSide
-      ? _toRawBasePerQuote(_invert(_anchorWad))  // opposite flow is quote -> base
+      ? _toRawBasePerQuote(_invert(_anchorWad)) // opposite flow is quote -> base
       : _toRawQuotePerBase(_anchorWad); //         opposite flow is base  -> quote
 
     (uint256 _currentSideFlow, uint256 _oppositeSideFlow) =
