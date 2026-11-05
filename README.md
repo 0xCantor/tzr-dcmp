@@ -1,11 +1,20 @@
 # Tessera propAMM (Base) reconstruction
 
+## Overview
+
+A readable Solidity deconstruction of Tessera, not a full decompilation. Sources are the Dedaub decompiler (Yul/Solidity-like output), the Heimdall decompiler and the paper (in References). Much of the logic and naming follows the paper.
+
 ## Architecture
 
-```
-trader ─► TesseraSwap (router) ─► TesseraEngine ─► book proxy ─► TesseraBook (logic)
-              │                    (manager + factory)    │
-              └─ moves tokens ◄── treasury (inventory)    └─ prices only, never moves tokens
+```mermaid
+flowchart LR
+  T[Trader] --> R[TesseraSwap<br/>router]
+  R <-->|tokens| TR[Treasury<br/>inventory]
+  R --> E[TesseraEngine<br/>manager + factory]
+  E --> P[Book proxy<br/>one per pair]
+  U[Updaters] -->|raw quote word| P
+  O[Operator] -->|updateBook, config| P
+  P -->|delegatecall| B[TesseraBook<br/>implementation, prices only]
 ```
 
 - **Router (`TesseraSwap`)**: pays output from the treasury and pulls input from the caller. Forwards its `msg.sender` as `sender`.
@@ -15,7 +24,7 @@ trader ─► TesseraSwap (router) ─► TesseraEngine ─► book proxy ─►
   - `Quote`: tag, refBlock, priceAnchor, spreadPpm.
   - Two sides of the clob (bids, asks), ≤19 levels + terminator. Level price = top-of-book price * multiplier. Replaced wholesale by `updateBook`.
   - Two flow accumulators. They reset on each book update and opposite flow nets against own flow at the anchor.
-- **Swap**: walk the side (skip excluded levels and depth already consumed by net flow) -> gross output -> `out = gross × (1 − fee)`. Previews carry no mode fee.
+- **Swap**: walk the ladder (skip excluded levels and depth already consumed by net flow) -> gross output -> `out = gross × (1 − fee)`. Previews carry no mode fee.
 - **Fee (ppm, capped at 1e6)**: mode + age + base + default + priority + address. Age = grace, then quadratic, then no fill at expiry. Address = blacklist, penalized or fingerprint helper. Default fee is flipped within blocks by the operator.
 
 ## Why price updates are cheap
@@ -51,7 +60,13 @@ $$\phi_{age}=\begin{cases}0 & a<g\\ \min\left(C,\ c\,(a-g+1)^2\right) & g\le a<E
 - **Address.** Labels come from the engine and apply to both `sender` and `tx.origin`. In whitelist-only mode only default-exempt senders trade and no address fee is charged. Otherwise a blacklisted address reverts, a penalized address pays `addressFee` and any other address pays `addressFee` only if the fingerprint helper matches.
 - **Mode.** An external helper maps the first byte of the swap data to a fee. Previews do not include it.
 - **Base.** A constant per book.
-- **Gas burn (not a fee).** Each successful swap runs a loop of 1000 memory allocations and a penalized address runs another 500. Neither changes state. The cost is roughly 150-200k and 70-100k gas (estimated, not measured). Its purpose is inferred as a gas-denominated tax, since the paper does not mention it. This could be a misleading decompilation, but the loop is present in multiple decompiled contracts and in the bytecode. 
+- **Gas burn (not a fee).** Each successful swap runs a loop of 1000 memory allocations and a penalized address runs another 500. Neither changes state. On this reconstruction they cost about 151k and 88k gas. A swap costs about 50k gas without the loop and 201k with it.
+
+  The paper does not mention the loop, so its purpose is unknown. A plausible reading, based on how Base orders transactions:
+  - Base orders by priority fee per gas, but a transaction pays that fee on all the gas it uses. Raising a swap from 50k to 201k gas makes a bid for an early block position about 4 times more expensive. This targets takers who race the operator's quote update to fill at a stale price. It works together with the priority fee component, which charges such trades in ppm of output.
+  - The 500 extra iterations raise this cost further for addresses the operator has already flagged as penalized. Previews include them too, so contracts that simulate a trade on chain before executing it also pay more.
+  - The loop runs only after all checks pass, so reverted attempts do not pay it. It taxes executed trades, not probing.
+  - A side effect: aggregators subtract gas cost from quoted output, so small trades are less likely to be routed to Tessera. Whether this is intended is unknown.
 
 ## CLOB complexity
 
@@ -85,13 +100,15 @@ $$D_s=\max\left(0,\ A_s-A_{\bar s}\,P_{\bar s\to s}\right)$$
 
 ## Open questions
 
-- Gas burn purpose is inferred and its gas cost is estimated.
+- Gas burn purpose is inferred.
 - Flow accumulator unit (input vs output) and `factor` semantics are inferred. Verify via the storage diff of the accumulator slots in a swap tx and the on-chain `factor`.
 - `Swap` event argument types are guessed.
 - `BookParams` middle fields (`baseFee` ... `priorityFee`) are mapped from types and range checks only.
 - `setDefaultFee` on a wrong block: revert or no-op is unverified.
 - Engine constructor values, the pair-key hash encoding and the two-hop condition are inferred.
 - Helper contracts (fingerprint, mode fee) are not decompiled. Selectors `0x1ed58fc8` and `0x4a89bec0` are raw `staticcall`s.
+- Deviation: the quote word uses Solidity's packing of `Quote` (tag in the lowest byte). The live proxy uses the reverse order (tag in the highest byte) and accepts 25-byte calldata.
+- Tests (`forge test`, 15 cases) cover quote and book updates, swaps and previews. They check the reconstruction against itself and hand-computed values, not against the live contracts.
 - Rounding: ceil is marked `TODO: round UP` in exact-out and the fee gross-up. Use libs for that.
 - The paper does not specify the age curve, priority threshold, `factor`, accumulator reset or exact-out handling. Those come from the decompilation alone.
 

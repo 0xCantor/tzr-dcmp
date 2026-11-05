@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.24;
 
+import {ITesseraBook} from '../interfaces/ITesseraBook.sol';
+
 /*//////////////////////////////////////////////////////////////////////////////////////////
     Tessera book PROXY, i.e. the quote update (anchor / spread / refBlock / tag), the ~27k-gas path from the paper.
 
@@ -10,17 +12,21 @@ pragma solidity ^0.8.24;
 
     HOW IT WORKS
       - There is no function selector. An authorised updater sends one word, which is written verbatim into slot 0.
-        (Calldata shorter than 32 bytes is zero-padded: the sample tx is 25 bytes, the 7 low zero bytes are dropped.)
       - Authorised = one of 10 addresses baked into the proxy (immutables, listed below).
       - The only check is on the tag: it must advance by 1..15 (mod 256). That orders updates, rejects replays and
         stale ones, and lets several updaters race for the same block.
       - NOTHING else is validated: refBlock is whatever the updater says (not block.number), and the anchor and
         spread have no range checks. An old or future refBlock just makes swaps refuse to fill (age fee).
 
-    PACKED WORD (high bit -> low bit), checked against the sample tx
-      0xd5 00032d03de 00000000000000000f8aecc9e95c9480 000015 (+ 7 zero bytes)
+    PACKED WORD
+      DEVIATION from the live proxy: the word uses Solidity's packing of `ITesseraBook.Quote`, so the book reads it as a
+      plain struct. Low bit -> high bit:
         tag u8 | refBlock u40 | priceAnchor u128 | spreadPpm u24 | 56 unused bits
-        213    | 53281758    | 1.1199678e18       | 21 ppm       | 0
+      The live proxy uses the reverse order (tag in the HIGHEST byte), checked against the sample tx:
+        0xd5 00032d03de 00000000000000000f8aecc9e95c9480 000015 (+ 7 zero bytes)
+        213    | 53281758    | 1.1199678e18       | 21 ppm
+      There, calldata shorter than 32 bytes is zero-padded, so updaters send 25 bytes. Here the 56 unused bits are the
+      HIGH bits, so updaters must send all 32 bytes. Checks, storage and gas are otherwise the same.
 
     OTHER BEHAVIOUR
       - selector 0xa9977bfe: public getter, returns slot 0.
@@ -44,8 +50,8 @@ contract TesseraBookProxy {
   /// @dev ERC-1967 implementation slot.
   bytes32 internal constant IMPLEMENTATION_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
 
-  /// @dev Slot 0, shared with the implementation (`Quote public quote`). Raw word, layout above.
-  uint256 internal quoteWord;
+  /// @dev Slot 0, shared with the implementation (same declaration there). Written as a raw word, layout above.
+  ITesseraBook.Quote internal quote;
 
   // The 10 quote updaters of THIS proxy (read from the live book 0x4B96...6Bd4; other books may differ):
   //   0x2744e8f08cd7f0ba46530420bf38fc7476e9e754   0x2913814212d15889a7fe91ef5b17c7530074146c
@@ -97,43 +103,14 @@ contract TesseraBookProxy {
   }
 
   /*////////////////////////////////////////////////////////////
-                       EXTERNAL VIEW FUNCTIONS
-  ////////////////////////////////////////////////////////////*/
-
-  /// @dev What an updater sends. (Off-chain helper.)
-  function encodeQuote(
-    uint8 _tag,
-    uint40 _refBlock,
-    uint128 _priceAnchor,
-    uint24 _spreadPpm
-  ) public pure returns (bytes32) {
-    return bytes32(
-      (uint256(_tag) << 248) | (uint256(_refBlock) << 208) | (uint256(_priceAnchor) << 80) | (uint256(_spreadPpm) << 56)
-    );
-  }
-
-  /// @dev Reads slot 0 the way the implementation does.
-  function decodeQuote(uint256 _word)
-    public
-    pure
-    returns (uint8 _tag, uint40 _refBlock, uint128 _priceAnchor, uint24 _spreadPpm)
-  {
-    _tag = uint8(_word >> 248);
-    _refBlock = uint40(_word >> 208);
-    _priceAnchor = uint128(_word >> 80);
-    _spreadPpm = uint24(_word >> 56);
-  }
-
-  /*////////////////////////////////////////////////////////////
                        EXTERNAL WRITE FUNCTIONS
   ////////////////////////////////////////////////////////////*/
 
   fallback() external payable {
     // 1. Public getter.
     if (msg.data.length >= 4 && bytes4(msg.data) == QUOTE_GETTER) {
-      uint256 _word = quoteWord;
       assembly {
-        mstore(0x80, _word)
+        mstore(0x80, sload(quote.slot))
         return(0x80, 0x20)
       }
     }
@@ -157,16 +134,18 @@ contract TesseraBookProxy {
   function _updateQuote() private {
     uint256 _newQuote;
     assembly {
-      _newQuote := calldataload(0) // zero-pads short calldata
+      _newQuote := calldataload(0)
     }
 
     uint8 _tagStep;
     unchecked {
-      _tagStep = uint8(_newQuote >> 248) - uint8(quoteWord >> 248); // wraps mod 256
+      _tagStep = uint8(_newQuote) - quote.tag; // tag is the lowest byte, wraps mod 256
     }
     if (_tagStep == 0 || _tagStep > MAX_TAG_STEP) revert InvalidTagStep();
 
-    quoteWord = _newQuote;
+    assembly {
+      sstore(quote.slot, _newQuote) // one SSTORE of the whole word
+    }
   }
 
   function _isUpdater(address _caller) private view returns (bool) {

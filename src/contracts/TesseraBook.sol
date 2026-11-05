@@ -279,11 +279,11 @@ contract TesseraBook is ITesseraBook {
   //   - no zero-amount check and no zero-result check.
 
   /// @notice Net output `sell` would give right now, or 0 if it cannot fill / the quote is expired.
-  function previewSell(bool _takeBidSide, uint256 _amountIn, address _sender)
-    external
-    view
-    returns (uint256 _netOutput)
-  {
+  function previewSell(
+    bool _takeBidSide,
+    uint256 _amountIn,
+    address _sender
+  ) external view returns (uint256 _netOutput) {
     _requireSwapAllowed();
 
     // Same order as the original: walk first, fee second (the fee check runs even if the walk found no depth).
@@ -297,11 +297,11 @@ contract TesseraBook is ITesseraBook {
 
   /// @notice Input `buy` would charge right now for exactly `_amountOut`, or NOT_FILLABLE (uint256.max) if it cannot fill.
   /// @dev NOT_FILLABLE covers: no quote on this side, expired quote, fee that cannot be grossed up, too little depth.
-  function previewBuy(bool _takeBidSide, uint256 _amountOut, address _sender)
-    external
-    view
-    returns (uint256 _netInput)
-  {
+  function previewBuy(
+    bool _takeBidSide,
+    uint256 _amountOut,
+    address _sender
+  ) external view returns (uint256 _netInput) {
     _requireSwapAllowed();
 
     (bool _hasQuote,,, uint40 _refBlock,) = bestPrice(_takeBidSide);
@@ -361,11 +361,12 @@ contract TesseraBook is ITesseraBook {
   ///        The fee uses it, together with tx.origin, for the address checks (paper, App. C.2).
   ///        It is NOT the token recipient: the book never sees that address.
   /// @param _data first byte = fee "mode" (0 if empty).
-  function sell(bool _takeBidSide, uint256 _amountIn, address _sender, bytes calldata _data)
-    external
-    nonReentrant
-    returns (uint256 _amountOut)
-  {
+  function sell(
+    bool _takeBidSide,
+    uint256 _amountIn,
+    address _sender,
+    bytes calldata _data
+  ) external nonReentrant returns (uint256 _amountOut) {
     _requireSwapAllowed();
     if (_amountIn == 0) revert ZeroAmount();
 
@@ -391,11 +392,12 @@ contract TesseraBook is ITesseraBook {
   /// @notice Exact-output swap. Returns the input the taker has to pay for exactly `_amountOut` (net of fees).
   /// @dev Same as `sell`, except the order of the steps: the fee is computed FIRST, the wanted output is grossed up
   ///      so that it is still `_amountOut` after the fee, and only then is the book walked backwards.
-  function buy(bool _takeBidSide, uint256 _amountOut, address _sender, bytes calldata _data)
-    external
-    nonReentrant
-    returns (uint256 _amountIn)
-  {
+  function buy(
+    bool _takeBidSide,
+    uint256 _amountOut,
+    address _sender,
+    bytes calldata _data
+  ) external nonReentrant returns (uint256 _amountIn) {
     _requireSwapAllowed();
     if (_amountOut == 0) revert ZeroAmount();
 
@@ -616,11 +618,11 @@ contract TesseraBook is ITesseraBook {
   /// @param _modeFeePpm pass `_modeFee(mode)` for swaps and 0 for previews.
   /// @return _rejected true when the quote is too old to be filled (see _ageFeePpm).
   /// @dev Reverts for blacklisted addresses, and for non-whitelisted ones when `whitelistOnly` is on.
-  function _computeFee(address _sender, uint40 _refBlock, uint256 _modeFeePpm)
-    internal
-    view
-    returns (bool _rejected, uint256 _feePpm)
-  {
+  function _computeFee(
+    address _sender,
+    uint40 _refBlock,
+    uint256 _modeFeePpm
+  ) internal view returns (bool _rejected, uint256 _feePpm) {
     // 1. Age. Also the only reason a quote can be rejected.
     uint256 _ageFee = _ageFeePpm(_refBlock);
     if (_ageFee == NO_FILL) return (true, 0);
@@ -761,7 +763,7 @@ contract TesseraBook is ITesseraBook {
 
     // Converts the OPPOSITE side's flow into this side's input units, at the anchor (the neutral price).
     uint256 _inventoryConversionPrice = _takeBidSide
-      ? _toRawBasePerQuote(_invert(_anchorWad)) // opposite flow is quote -> base
+      ? _toRawBasePerQuote(_invert(_anchorWad))  // opposite flow is quote -> base
       : _toRawQuotePerBase(_anchorWad); //         opposite flow is base  -> quote
 
     (uint256 _currentSideFlow, uint256 _oppositeSideFlow) =
